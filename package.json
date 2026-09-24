@@ -1,0 +1,48 @@
+{
+  "name": "load-test-studio",
+  "version": "1.0.0",
+  "description": "Load Test Studio: record browser journeys with Playwright, turn them into correlated API workflows, and run them as distributed load tests (RabbitMQ + Redis) with pass/fail criteria and reports.",
+  "type": "module",
+  "bin": {
+    "lt": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc",
+    "build:web": "tsc -p web && vite build --config web/vite.config.ts",
+    "start": "node --disable-warning=ExperimentalWarning dist/src/server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --import tsx --watch src/server/index.ts",
+    "dev:web": "vite --config web/vite.config.ts",
+    "typecheck": "tsc --noEmit && tsc -p web",
+    "test": "node --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts",
+    "lt": "tsx src/cli.ts",
+    "worker": "tsx src/cli.ts worker",
+    "infra:up": "docker compose up -d --wait rabbitmq redis",
+    "infra:down": "docker compose down"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@fastify/static": "^8.3.0",
+    "amqplib": "^0.10.4",
+    "commander": "^12.1.0",
+    "fastify": "^5.12.5",
+    "ioredis": "^5.4.1",
+    "playwright": "^1.47.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.5",
+    "@types/node": "^22.7.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.6",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.4.3"
+  }
+}

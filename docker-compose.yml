@@ -1,0 +1,83 @@
+# Distributed stack (RabbitMQ + Redis + app + workers):  docker compose up -d --build
+# In-memory only (no RabbitMQ/Redis):  docker build -t load-test-studio . && docker run -p 4100:4100 -v lt-data:/data load-test-studio
+# Infrastructure only:  docker compose up -d rabbitmq redis   (run the app natively for live recording)
+# More load:            docker compose up -d --scale worker=5
+# Host ports are overridable (useful on Windows where 15672 is often reserved):
+#   APP_PORT, AMQP_PORT, RABBITMQ_UI_PORT, REDIS_PORT
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "${AMQP_PORT:-5672}:5672"             # AMQP
+      - "${RABBITMQ_UI_PORT:-15672}:15672"    # management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - ./docker/rabbitmq.conf:/etc/rabbitmq/conf.d/20-load-test.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # Web UI + API (controller). Results are stored in the app-data volume.
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-4100}:4100"
+    environment:
+      LT_MODE: distributed
+      AMQP_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+      REDIS_URL: redis://redis:6379
+      LT_AUTH_USER: ${LT_AUTH_USER:-}
+      LT_AUTH_PASSWORD: ${LT_AUTH_PASSWORD:-}
+      LT_API_TOKEN: ${LT_API_TOKEN:-}
+      LT_EMBEDDED_WORKER: "false"        # dedicated workers below
+      LT_RECORDER_ENABLED: "false"       # containers have no display: import HAR files instead
+    volumes:
+      - app-data:/data
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # Load generators. Scale with: docker compose up -d --scale worker=5
+  worker:
+    build: .
+    command: ["node", "dist/src/cli.js", "worker"]
+    environment:
+      LT_MODE: distributed
+      AMQP_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+      REDIS_URL: redis://redis:6379
+      LT_CONCURRENCY: ${LT_WORKER_CONCURRENCY:-200}
+    healthcheck:
+      disable: true
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach apps running on your machine
+    stop_grace_period: 30s
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+
+volumes:
+  app-data:
