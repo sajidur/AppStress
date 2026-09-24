@@ -1,8 +1,10 @@
 import { performance } from 'node:perf_hooks';
-import type { Step, Workflow } from '../types.js';
+import type { CallSample, Step, Workflow } from '../types.js';
 import { errorMessage, sleepInterruptible } from '../util.js';
+import { applyAuth } from './auth.js';
 import { CookieJar } from './cookies.js';
 import { parseSetCookies, runExtractor, type ResponseView } from './extract.js';
+import { cut, maskHeaders, maskText, maskVars, type CallSampler } from './sampling.js';
 import { render, renderRecord, type Vars } from './template.js';
 
 export const ITERATION_METRIC = '__iteration__';
@@ -27,8 +29,12 @@ export interface StepTrace {
   error?: string;
   extracted: Vars;
   cached?: boolean;
+  /** workflow-level authentication: applied, skipped (variable not available yet) or own (step sets its own header) */
+  auth?: 'applied' | 'skipped' | 'own';
   requestBody?: string;
   responseSnippet?: string;
+  /** full request/response details; present when the sampler asked for this call */
+  call?: CallSample;
 }
 
 export interface VirtualUserOptions {
@@ -40,11 +46,19 @@ export interface VirtualUserOptions {
   requestTimeoutMs: number;
   thinkTimeScale: number;
   shouldStop: () => boolean;
+  /** keeps full request/response details for selected calls (reports); optional */
+  sampler?: CallSampler;
   /** called after every step; used by `lt validate` */
   onTrace?: (trace: StepTrace) => void;
 }
 
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+/** What the fetch actually did, for call details: the first hop's headers (with cookies) and the redirects followed. */
+interface FetchProbe {
+  sent?: Record<string, string>;
+  hops: { status: number; url: string }[];
+}
 
 /**
  * One simulated user: owns a cookie jar and a variable scope, and executes the
@@ -53,6 +67,8 @@ const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 export class VirtualUser {
   private jar = new CookieJar();
   private vars: Vars = {};
+  private phase: CallSample['phase'] = 'setup';
+  private iteration = 0;
 
   constructor(private readonly o: VirtualUserOptions) {
     this.setUser(o.user);
@@ -66,11 +82,14 @@ export class VirtualUser {
   }
 
   runSetup(): Promise<boolean> {
+    this.phase = 'setup';
     return this.runSteps(this.o.workflow.setup);
   }
 
   async runIteration(iteration: number): Promise<boolean> {
     this.vars.$iteration = String(iteration);
+    this.phase = 'iteration';
+    this.iteration = iteration;
     const t0 = performance.now();
     const ok = await this.runSteps(this.o.workflow.steps);
     if (this.o.workflow.steps.length && !this.o.shouldStop()) {
@@ -115,6 +134,7 @@ export class VirtualUser {
     }
 
     let url: string, method: string, headers: Record<string, string>, body: string | undefined;
+    let authStatus: StepTrace['auth'];
     try {
       method = step.request.method.toUpperCase();
       url = render(step.request.url, this.vars);
@@ -123,22 +143,31 @@ export class VirtualUser {
         ...renderRecord(step.request.headers, this.vars),
       };
       body = step.request.body !== undefined ? render(step.request.body, this.vars) : undefined;
+      const auth = this.o.workflow.auth;
+      if (auth && !step.skipAuth) {
+        const r = applyAuth(auth, this.vars, headers, url);
+        url = r.url;
+        authStatus = r.status;
+      }
     } catch (e) {
       const error = `template: ${errorMessage(e)}`;
       metrics.record(step.name, 0, 0, error);
-      onTrace?.({ step: step.name, method: step.request.method, url: step.request.url, status: 0, durationMs: 0, error, extracted: {} });
+      const call = this.sample(step, { method: step.request.method, url: step.request.url, headers: { ...(step.request.headers ?? {}) }, body: step.request.body, ms: 0, error, extracted: {} });
+      onTrace?.({ step: step.name, method: step.request.method, url: step.request.url, status: 0, durationMs: 0, error, extracted: {}, call });
       return false;
     }
 
     const t0 = performance.now();
     let res: ResponseView;
+    const probe: FetchProbe = { hops: [] };
     try {
-      res = await this.fetchFollowingRedirects(method, url, headers, body);
+      res = await this.fetchFollowingRedirects(method, url, headers, body, probe);
     } catch (e) {
       const ms = performance.now() - t0;
       const error = (e as Error)?.name === 'TimeoutError' ? `timeout after ${this.o.requestTimeoutMs}ms` : errorMessage(e);
       metrics.record(step.name, ms, 0, error);
-      onTrace?.({ step: step.name, method, url, status: 0, durationMs: ms, error, extracted: {}, requestBody: body });
+      const call = this.sample(step, { method, url, headers, body, ms, error, extracted: {}, auth: authStatus, probe });
+      onTrace?.({ step: step.name, method, url, status: 0, durationMs: ms, error, extracted: {}, auth: authStatus, requestBody: body, call });
       return false;
     }
     const ms = performance.now() - t0;
@@ -168,6 +197,7 @@ export class VirtualUser {
     }
 
     metrics.record(step.name, ms, res.status, error);
+    const call = this.sample(step, { method, url, headers, body, res, ms, error, extracted, auth: authStatus, probe });
     onTrace?.({
       step: step.name,
       method,
@@ -176,8 +206,10 @@ export class VirtualUser {
       durationMs: ms,
       error,
       extracted,
+      auth: authStatus,
       requestBody: body,
       responseSnippet: res.body.slice(0, 300),
+      call,
     });
 
     if (!error && step.cache && cache && cacheKey) {
@@ -187,12 +219,74 @@ export class VirtualUser {
     return !error;
   }
 
+  /** Build the full details of one call when the sampler wants it (returns undefined otherwise). */
+  private sample(
+    step: Step,
+    c: {
+      method: string;
+      url: string;
+      headers: Record<string, string>;
+      body?: string;
+      res?: ResponseView;
+      ms: number;
+      error?: string;
+      extracted: Vars;
+      auth?: CallSample['auth'];
+      probe?: FetchProbe;
+    },
+  ): CallSample | undefined {
+    const sampler = this.o.sampler;
+    if (!sampler || !sampler.want(step.name, !!c.error)) return undefined;
+    const { maskSecrets, bodyKb } = sampler.capture;
+    const max = bodyKb * 1024;
+    const m = (t: string) => (maskSecrets ? maskText(t) : t);
+    const reqBody = cut(c.body, max);
+    const sample: CallSample = {
+      step: step.name,
+      outcome: c.error ? 'error' : 'ok',
+      phase: this.phase,
+      at: Date.now() - Math.round(c.ms),
+      vu: this.o.vuIndex,
+      iteration: this.iteration,
+      durationMs: c.ms,
+      request: {
+        method: c.method,
+        url: m(c.url),
+        headers: maskSecrets ? maskHeaders(c.probe?.sent ?? c.headers) : (c.probe?.sent ?? c.headers),
+        ...(reqBody.text !== undefined ? { body: m(reqBody.text) } : {}),
+        ...(reqBody.truncated ? { bodyTruncated: true } : {}),
+      },
+      ...(c.error ? { error: c.error } : {}),
+      extracted: maskSecrets ? maskVars(c.extracted) : c.extracted,
+      ...(c.auth ? { auth: c.auth } : {}),
+      ...(maskSecrets ? { masked: true } : {}),
+    };
+    if (c.probe?.hops.length) sample.redirects = c.probe.hops;
+    if (c.res) {
+      const resBody = cut(c.res.body, max);
+      const headers: Record<string, string> = {};
+      c.res.headers.forEach((v, k) => (headers[k] = v));
+      const setCookie = c.res.headers.getSetCookie();
+      if (setCookie.length) headers['set-cookie'] = setCookie.join('\n');
+      sample.response = {
+        status: c.res.status,
+        headers: maskSecrets ? maskHeaders(headers) : headers,
+        ...(resBody.text !== undefined ? { body: m(resBody.text) } : {}),
+        ...(resBody.truncated ? { bodyTruncated: true } : {}),
+        bytes: Buffer.byteLength(c.res.body),
+      };
+    }
+    sampler.add(sample);
+    return sample;
+  }
+
   /** fetch with manual redirects so Set-Cookie on every hop lands in the jar. */
   private async fetchFollowingRedirects(
     method: string,
     url: string,
     headers: Record<string, string>,
     body: string | undefined,
+    probe: FetchProbe,
   ): Promise<ResponseView> {
     const signal = AbortSignal.timeout(this.o.requestTimeoutMs);
     let currentUrl = url;
@@ -205,6 +299,7 @@ export class VirtualUser {
       const cookie = this.jar.header(currentUrl);
       const reqHeaders = { ...hdrs };
       if (cookie) reqHeaders.cookie = reqHeaders.cookie ? `${reqHeaders.cookie}; ${cookie}` : cookie;
+      if (hop === 0) probe.sent = reqHeaders;
 
       const res = await fetch(currentUrl, {
         method: currentMethod,
@@ -221,6 +316,7 @@ export class VirtualUser {
       if (REDIRECTS.has(res.status) && location) {
         await res.arrayBuffer().catch(() => undefined);
         currentUrl = new URL(location, currentUrl).toString();
+        probe.hops.push({ status: res.status, url: currentUrl });
         if (res.status === 303 || ((res.status === 301 || res.status === 302) && currentMethod === 'POST')) {
           currentMethod = 'GET';
           currentBody = undefined;

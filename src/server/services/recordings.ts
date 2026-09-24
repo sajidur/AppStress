@@ -47,8 +47,8 @@ export class RecordingService {
       })
       .catch((e) => {
         this.log.error({ testId, err: errorMessage(e) }, 'recording failed');
-        const hint = /Executable doesn't exist|browserType.launch/i.test(errorMessage(e))
-          ? ' — run "npx playwright install chromium" on the server'
+        const hint = /Executable doesn't exist|browserType.launch|distribution .chrome. is not found/i.test(errorMessage(e))
+          ? ' — install Google Chrome on the server (https://www.google.com/chrome) and try again'
           : '';
         this.hub.publish(topic, { type: 'failed', error: errorMessage(e) + hint });
       })

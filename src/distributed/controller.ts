@@ -3,7 +3,7 @@ import type { Backend, StateBackend } from '../backend/types.js';
 import { config } from '../config.js';
 import { printSummary, writeReports } from '../metrics/report.js';
 import type { RunStats } from '../metrics/stats.js';
-import type { RunConfig, UsersMode, VuJob, Workflow } from '../types.js';
+import { DEFAULT_CAPTURE, type CallSample, type CaptureSettings, type RunConfig, UsersMode, VuJob, Workflow } from '../types.js';
 import { log, sleep } from '../util.js';
 
 export type { WorkerInfo } from '../backend/types.js';
@@ -18,6 +18,8 @@ export interface LaunchOptions {
   usersMode: UsersMode;
   thinkTimeScale: number;
   requestTimeoutMs: number;
+  /** how many calls per step keep full request/response details (default: DEFAULT_CAPTURE) */
+  capture?: CaptureSettings;
   runId?: string;
   /** seconds between VU job publication and the start of VU #0 */
   startDelaySec?: number;
@@ -72,6 +74,7 @@ export async function launchRun(backend: Backend, o: LaunchOptions): Promise<Run
     usersCount: o.users.length,
     thinkTimeScale: o.thinkTimeScale,
     requestTimeoutMs: o.requestTimeoutMs,
+    capture: o.capture ?? DEFAULT_CAPTURE,
     startAt,
     endAt,
     createdAt: Date.now(),
@@ -174,7 +177,8 @@ export async function runAndReport(backend: Backend, o: LaunchOptions & { report
   process.off('SIGINT', onSigint);
 
   printSummary(stats);
-  const files = writeReports(stats, o.workflow, o.reportDir);
+  const samples = await backend.state.loadSamples(cfg.runId).catch(() => []);
+  const files = writeReports(stats, o.workflow, o.reportDir, { samples, capture: cfg.capture });
   log('controller', `Reports: ${files.join(', ')}`);
   return stats;
 }

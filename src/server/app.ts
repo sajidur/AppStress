@@ -26,7 +26,7 @@ import {
   validateSchema,
   workflowSchema,
 } from './schemas.js';
-import { applySettings, HttpError, maskRows, parseUsersFile, suggestUserFields, validateWorkflow } from './services/helpers.js';
+import { applySettings, HttpError, maskRows, parseUsersFile, sampleExchange, suggestUserFields, validateWorkflow } from './services/helpers.js';
 import { recordingTopic, RecordingService } from './services/recordings.js';
 import { RunService, runTopic } from './services/runs.js';
 
@@ -281,6 +281,16 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     return { userFields: suggestUserFields(rec.recording, rows) };
   });
 
+  /** The recorded response of an exchange: values a later request can bind to (JSON paths, headers, cookies, hidden fields). */
+  app.get('/api/tests/:id/workflow/response-sample/:exchangeId', async (req: FastifyRequest<{ Params: { id: string; exchangeId: string } }>) => {
+    requireTest(req.params.id);
+    const rec = store.getRecording(req.params.id);
+    if (!rec) throw new HttpError(404, 'No recording for this test');
+    const ex = rec.recording.exchanges.find((e) => e.id === Number(req.params.exchangeId));
+    if (!ex) throw new HttpError(404, 'That request is not in the recording');
+    return sampleExchange(ex);
+  });
+
   app.post('/api/tests/:id/workflow/build', async (req: IdParams) => {
     const test = requireTest(req.params.id);
     const rec = store.getRecording(test.id);
@@ -310,6 +320,7 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     const result = await validateWorkflow(applySettings(test.workflow, test.settings), user, {
       iterations,
       requestTimeoutMs: test.settings.requestTimeoutMs,
+      capture: test.settings.capture,
     });
     const masked = rows.length ? maskRows([user], Object.keys(user))[0] : null;
     return { ...result, user: masked, userIndex: rows.length ? userIndex % rows.length : null };
@@ -354,6 +365,15 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     return { ...run, stats: details.stats, progress: runs.latestProgress(run.id) ?? null };
   });
 
+  /** Full request/response details of the calls kept during the run (live while it runs). */
+  app.get('/api/runs/:id/samples', async (req: IdParams) => {
+    const run = requireRun(req.params.id);
+    const wf = store.getRunDetails(run.id)?.workflow;
+    // the request as configured (variables not yet filled in), so each call can be compared with its definition
+    const steps = [...(wf?.setup ?? []), ...(wf?.steps ?? [])].map((s) => ({ name: s.name, request: s.request }));
+    return { capture: run.config?.capture ?? null, steps, samples: await runs.samples(run.id) };
+  });
+
   app.get('/api/runs/:id/events', async (req: IdParams, reply) => {
     const run = requireRun(req.params.id);
     const initial: object[] = [{ type: 'status', status: run.status }];
@@ -387,12 +407,12 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     return reply
       .type('text/html; charset=utf-8')
       .header('content-disposition', `inline; filename="${run.id}.html"`)
-      .send(renderHtml(stats, { ...workflow, name: run.testName ?? workflow.name }, { verdict: run.verdict ?? undefined, thresholds: run.thresholds ?? [] }));
+      .send(renderHtml(stats, { ...workflow, name: run.testName ?? workflow.name }, { verdict: run.verdict ?? undefined, thresholds: run.thresholds ?? [], samples: store.getRunSamples(run.id), capture: run.config?.capture }));
   });
 
   app.get('/api/runs/:id/report.json', async (req: IdParams, reply) => {
     const { run, stats } = finishedRun(req.params.id);
-    return reply.header('content-disposition', `attachment; filename="${run.id}.json"`).send({ run, stats });
+    return reply.header('content-disposition', `attachment; filename="${run.id}.json"`).send({ run, stats, samples: store.getRunSamples(run.id) });
   });
 
   app.get('/api/runs/:id/junit.xml', async (req: IdParams, reply) => {

@@ -1,4 +1,6 @@
 import type { MetricSink } from '../engine/executor.js';
+import type { CallSampler } from '../engine/sampling.js';
+import type { CallSample, CaptureSettings } from '../types.js';
 import { bucketOf } from './histogram.js';
 
 export interface StepAgg {
@@ -23,16 +25,36 @@ export interface Snapshot {
   timeline: Map<number, SecondAgg>;
   /** "step|message" -> count */
   errors: Map<string, number>;
+  /** calls kept with full request/response details since the last drain */
+  samples: CallSample[];
 }
 
-const emptySnapshot = (): Snapshot => ({ steps: new Map(), timeline: new Map(), errors: new Map() });
+const emptySnapshot = (): Snapshot => ({ steps: new Map(), timeline: new Map(), errors: new Map(), samples: [] });
+
+const NO_CAPTURE: CaptureSettings = { okSamples: 0, errorSamples: 0, bodyKb: 16, maskSecrets: true };
 
 /**
  * In-process aggregation. Workers record thousands of samples per second, so
  * samples are aggregated locally and flushed to Redis in one pipeline per interval.
  */
-export class MetricsCollector implements MetricSink {
+export class MetricsCollector implements MetricSink, CallSampler {
   private snap = emptySnapshot();
+  private kept = new Map<string, number>();
+
+  /** capture: how many calls per step keep full details (default: none) */
+  constructor(readonly capture: CaptureSettings = NO_CAPTURE) {}
+
+  /** Per worker and run: the first okSamples successful and errorSamples failed calls of every step. */
+  want(step: string, failed: boolean): boolean {
+    if (step.startsWith('__')) return false;
+    return (this.kept.get(`${step}|${failed}`) ?? 0) < (failed ? this.capture.errorSamples : this.capture.okSamples);
+  }
+
+  add(sample: CallSample): void {
+    const key = `${sample.step}|${sample.outcome === 'error'}`;
+    this.kept.set(key, (this.kept.get(key) ?? 0) + 1);
+    this.snap.samples.push(sample);
+  }
 
   record(step: string, durationMs: number, status: number, error?: string): void {
     let agg = this.snap.steps.get(step);

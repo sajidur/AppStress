@@ -3,7 +3,7 @@ import type { Backend } from '../../backend/types.js';
 import { launchRun, LaunchValidationError, monitorRun, newRunId, type RunProgress } from '../../distributed/controller.js';
 import type { RunStats } from '../../metrics/stats.js';
 import { evaluateThresholds } from '../../metrics/thresholds.js';
-import type { TestSettings, Workflow } from '../../types.js';
+import { DEFAULT_CAPTURE, type CallSample, type TestSettings, type Workflow } from '../../types.js';
 import { errorMessage } from '../../util.js';
 import { ACTIVE_STATUSES, type RunRow, type RunStatus, type RunSummary, type Store } from '../db.js';
 import type { EventHub } from '../events.js';
@@ -41,6 +41,14 @@ export class RunService {
     private readonly stateTtlSec: number,
   ) {}
 
+  /** Call details of a run: live from the state store while it runs, from the database once it finished. */
+  async samples(runId: string): Promise<CallSample[]> {
+    const run = this.store.getRun(runId);
+    if (!run) throw new HttpError(404, 'Run not found');
+    if (ACTIVE_STATUSES.includes(run.status)) return this.backend.state.loadSamples(runId).catch(() => []);
+    return this.store.getRunSamples(runId);
+  }
+
   latestProgress(runId: string): RunProgress | undefined {
     return this.latest.get(runId);
   }
@@ -67,6 +75,7 @@ export class RunService {
         usersMode: settings.usersMode,
         thinkTimeScale: settings.thinkTimeScale,
         requestTimeoutMs: settings.requestTimeoutMs,
+        capture: settings.capture ?? DEFAULT_CAPTURE,
       });
       this.store.updateRun(runId, { status: 'running', config: cfg, startedAt: cfg.startAt });
       this.log.info({ runId, testId, vus: settings.vus }, 'run launched');
@@ -123,6 +132,7 @@ export class RunService {
         this.hub.publish(topic, { type: 'progress', progress: p });
       });
 
+      const samples: CallSample[] = await this.backend.state.loadSamples(runId).catch(() => []);
       const run = this.store.getRun(runId)!;
       const iterations = await this.backend.state.getIterations(runId);
       const { verdict, results } = evaluateThresholds(stats, run.settings.thresholds ?? []);
@@ -131,6 +141,7 @@ export class RunService {
         status,
         verdict: outcome === 'timeout' ? 'error' : verdict,
         stats,
+        samples,
         summary: summarize(stats, iterations),
         thresholds: results,
         finishedAt: Date.now(),

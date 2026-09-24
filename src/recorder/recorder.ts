@@ -1,8 +1,9 @@
 import { EventEmitter } from 'node:events';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { chromium, type Browser, type Page, type Request } from 'playwright';
+import { chromium, type BrowserContext, type Page, type Request } from 'playwright';
 import type { RecordedExchange, Recording } from '../types.js';
 import { errorMessage, log } from '../util.js';
 
@@ -90,13 +91,27 @@ export class RecordingSession extends EventEmitter {
   }
 
   private async run(finished: Promise<void>): Promise<Recording> {
-    let browser: Browser | undefined;
+    let context: BrowserContext | undefined;
+    let profileDir: string | undefined;
+    const cleanup = async () => {
+      await context?.close().catch(() => undefined);
+      if (profileDir) rmSync(profileDir, { recursive: true, force: true, maxRetries: 3 });
+    };
     try {
-      browser = await chromium.launch({ headless: this.opts.headless ?? false });
-      // Service workers are blocked so every request is issued (and captured) by the page itself;
-      // otherwise requests served by a worker are invisible or have no page attached.
-      const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: null, serviceWorkers: 'block' });
-      const page = await context.newPage();
+      // A persistent (on-disk) profile rather than browser.newContext(): the latter is an ephemeral,
+      // incognito-like session that many apps detect (tiny storage quota) and then lock their login form.
+      profileDir = mkdtempSync(join(tmpdir(), 'lt-record-'));
+      context = await chromium.launchPersistentContext(profileDir, {
+        // The installed Google Chrome (not Playwright's bundled Chromium): some apps only accept real Chrome.
+        channel: 'chrome',
+        headless: this.opts.headless ?? false,
+        // Service workers are blocked so every request is issued (and captured) by the page itself;
+        // otherwise requests served by a worker are invisible or have no page attached.
+        ignoreHTTPSErrors: true,
+        viewport: null,
+        serviceWorkers: 'block',
+      });
+      const page = context.pages()[0] ?? (await context.newPage());
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
 
       const exchanges: RecordedExchange[] = [];
@@ -173,11 +188,11 @@ export class RecordingSession extends EventEmitter {
           }),
         );
         // Finish when the user closes the last tab/window.
-        p.on('close', safe('close', () => setTimeout(() => context.pages().length === 0 && this.finish(), 300)));
+        p.on('close', safe('close', () => setTimeout(() => context?.pages().length === 0 && this.finish(), 300)));
       };
       trackPage(page);
       context.on('page', safe('page', trackPage));
-      browser.on('disconnected', () => this.finish());
+      context.on('close', () => this.finish());
       const timer = this.opts.timeoutSec ? setTimeout(() => this.finish(), this.opts.timeoutSec * 1000) : undefined;
 
       log('record', `Opening ${this.opts.url}`);
@@ -196,7 +211,7 @@ export class RecordingSession extends EventEmitter {
       await finished;
       if (timer) clearTimeout(timer);
       await Promise.allSettled([...pending]);
-      await browser.close().catch(() => undefined);
+      await cleanup();
 
       exchanges.sort((a, b) => a.startedAt - b.startedAt || a.id - b.id);
       const recording: Recording = {
@@ -211,7 +226,7 @@ export class RecordingSession extends EventEmitter {
       this.emit('finished', recording);
       return recording;
     } catch (e) {
-      await browser?.close().catch(() => undefined);
+      await cleanup();
       const err = e instanceof Error ? e : new Error(String(e));
       this.emit('failed', err);
       throw err;

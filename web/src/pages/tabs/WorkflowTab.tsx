@@ -1,13 +1,63 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../../api';
+import {
+  BindField,
+  JsonFieldTable,
+  ParamTable,
+  PickExtractorDialog,
+  Section,
+  type BindContext,
+} from '../../components/bindings';
 import { Card, Empty, Field, fmt, MethodTag, useAction, useToast } from '../../components/ui';
-import type { BuildOptionsInput, Extractor, Step, ValidationResult, Workflow } from '../../types';
+import {
+  availableVars,
+  detectAuth,
+  detectBodyKind,
+  formFields,
+  joinForm,
+  joinUrl,
+  jsonFields,
+  placeholdersIn,
+  setJsonField,
+  splitUrl,
+  stripAuthorization,
+  unresolvedVars,
+  usedStepVars,
+  type StepRef,
+} from '../../bindings';
+import { CallDetail } from '../../components/CallDetail';
+import { useAsync } from '../../hooks';
+import type { AuthConfig, BuildOptionsInput, Extractor, Step, ValidationResult, Workflow } from '../../types';
 import type { TabProps } from '../TestPage';
+
+/* ================================================================= which recorded requests count as steps */
+
+interface RequestKind {
+  id: string;
+  label: string;
+  help: string;
+  /** Playwright resource types covered by this checkbox */
+  types: string[];
+}
+
+const REQUEST_KINDS: RequestKind[] = [
+  { id: 'document', label: 'Pages (document)', help: 'HTML page loads and form posts', types: ['document'] },
+  { id: 'xhr', label: 'API calls (XHR / fetch)', help: 'JSON / AJAX requests made by the page', types: ['xhr', 'fetch'] },
+  { id: 'script', label: 'JavaScript (js)', help: 'Script files', types: ['script'] },
+  { id: 'stylesheet', label: 'CSS', help: 'Stylesheets', types: ['stylesheet'] },
+  { id: 'image', label: 'Images', help: 'Pictures and icons', types: ['image'] },
+  { id: 'font', label: 'Fonts', help: 'Web fonts', types: ['font'] },
+  { id: 'media', label: 'Media', help: 'Audio / video', types: ['media'] },
+  { id: 'other', label: 'Other', help: 'Everything else (manifest, websocket, ...)', types: ['other', 'manifest', 'eventsource', 'texttrack', 'websocket'] },
+];
+
+const DEFAULT_TYPES = ['document', 'xhr', 'fetch'];
 
 const DEFAULT_OPTIONS: BuildOptionsInput = {
   userFields: {},
   includeDocuments: true,
+  resourceTypes: DEFAULT_TYPES,
   domains: [],
   exclude: [],
   minThinkMs: 500,
@@ -15,15 +65,35 @@ const DEFAULT_OPTIONS: BuildOptionsInput = {
   correlate: true,
 };
 
+/** Options saved before request types existed only have includeDocuments. */
+function initialOptions(saved: BuildOptionsInput | null): BuildOptionsInput {
+  if (!saved) return DEFAULT_OPTIONS;
+  return { ...saved, resourceTypes: saved.resourceTypes ?? (saved.includeDocuments === false ? ['xhr', 'fetch'] : DEFAULT_TYPES) };
+}
+
 /* ================================================================= build panel */
 
 function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
   const toast = useToast();
   const { busy, run } = useAction();
-  const [opts, setOpts] = useState<BuildOptionsInput>(test.buildOptions ?? DEFAULT_OPTIONS);
+  const [opts, setOpts] = useState<BuildOptionsInput>(() => initialOptions(test.buildOptions));
   const [fields, setFields] = useState<[string, string][]>(() => Object.entries(test.buildOptions?.userFields ?? {}));
   const [advanced, setAdvanced] = useState(false);
   const columns = test.dataset?.columns ?? [];
+  const recorded = useAsync(() => api.getRecording(test.id), [test.id, test.recording?.createdAt]);
+
+  const selected = new Set(opts.resourceTypes ?? DEFAULT_TYPES);
+  const counts = useMemo(() => {
+    const c = new Map<string, number>();
+    for (const e of recorded.data?.recording?.exchanges ?? []) c.set(e.resourceType, (c.get(e.resourceType) ?? 0) + 1);
+    return c;
+  }, [recorded.data]);
+  const countOf = (k: RequestKind) => k.types.reduce((n, t) => n + (counts.get(t) ?? 0), 0);
+  const toggleKind = (k: RequestKind, on: boolean) => {
+    const next = new Set(selected);
+    for (const t of k.types) (on ? next.add(t) : next.delete(t));
+    setOpts({ ...opts, resourceTypes: [...next], includeDocuments: next.has('document') });
+  };
 
   const detect = async () => {
     const r = await run(() => api.suggestUserFields(test.id));
@@ -43,9 +113,13 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
   }, []);
 
   const build = async () => {
+    if (selected.size === 0) {
+      toast('Select at least one request type to test.', 'error');
+      return;
+    }
     if ((test.workflow || dirty) && !confirm('Rebuilding replaces the current workflow, including your manual edits. Continue?')) return;
     const userFields = Object.fromEntries(fields.filter(([k, v]) => k.trim() && v !== ''));
-    const r = await run(() => api.buildWorkflow(test.id, { ...opts, userFields }));
+    const r = await run(() => api.buildWorkflow(test.id, { ...opts, includeDocuments: selected.has('document'), userFields }));
     if (r) {
       toast(`Workflow built: ${r.workflow.setup.length + r.workflow.steps.length} steps, ${r.report.correlations.length} dynamic values correlated`);
       await reload();
@@ -65,9 +139,29 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
   return (
     <Card
       title="3. Build the workflow from the recording"
-      hint="Recorded API calls become steps. Dynamic values (tokens, IDs, CSRF) are correlated automatically, and the values you typed are replaced with columns from the users file."
+      hint="Recorded requests become steps. Dynamic values (tokens, IDs, CSRF) are correlated automatically, and the values you typed are replaced with columns from the users file."
     >
       <div className="stack">
+        <div>
+          <div className="label">Request types that count as test steps</div>
+          <div className="help faint" style={{ fontSize: 12.5, margin: '4px 0 8px' }}>
+            Only the checked types of recorded requests become steps in the test. The number is how many of each were recorded.
+          </div>
+          <div className="kind-grid">
+            {REQUEST_KINDS.map((k) => {
+              const n = countOf(k);
+              return (
+                <label className="check kind" key={k.id} title={k.help}>
+                  <input type="checkbox" checked={k.types.some((t) => selected.has(t))} onChange={(e) => toggleKind(k, e.target.checked)} />
+                  <span>{k.label}</span>
+                  {recorded.data && <span className="chip">{n}</span>}
+                </label>
+              );
+            })}
+          </div>
+          {selected.size === 0 && <div className="callout warn" style={{ marginTop: 8 }}>Select at least one request type.</div>}
+        </div>
+
         <div>
           <div className="row between">
             <div className="label">Values typed during recording → users-file columns</div>
@@ -114,10 +208,6 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
             <div className="grid-2" style={{ marginTop: 10 }}>
               <div className="stack" style={{ gap: 10 }}>
                 <label className="check">
-                  <input type="checkbox" checked={opts.includeDocuments} onChange={(e) => setOpts({ ...opts, includeDocuments: e.target.checked })} />
-                  Include HTML page loads (not only XHR/fetch API calls)
-                </label>
-                <label className="check">
                   <input type="checkbox" checked={opts.correlate} onChange={(e) => setOpts({ ...opts, correlate: e.target.checked })} />
                   Correlate dynamic values automatically
                 </label>
@@ -160,7 +250,7 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
         </div>
 
         <div className="row">
-          <button className="btn primary" onClick={build} disabled={busy}>
+          <button className="btn primary" onClick={build} disabled={busy || selected.size === 0}>
             {test.workflow ? 'Rebuild workflow' : 'Build workflow'}
           </button>
           {test.workflow && <span className="faint">Rebuilding discards manual step edits.</span>}
@@ -202,6 +292,113 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
   );
 }
 
+/* ================================================================= authentication */
+
+const AUTH_LABELS: Record<AuthConfig['type'], string> = {
+  bearer: 'Bearer token (Authorization: Bearer …)',
+  basic: 'Basic (username and password)',
+  header: 'API key in a header',
+  query: 'API key in the URL',
+};
+
+function AuthPanel({ draft, setDraft, ctx }: { draft: Workflow; setDraft: (fn: (d: Workflow | null) => Workflow | null) => void; ctx: BindContext }) {
+  const toast = useToast();
+  const auth = draft.auth;
+  const set = (patch: Partial<AuthConfig>) => setDraft((d) => (d && d.auth ? { ...d, auth: { ...d.auth, ...patch } } : d));
+  const detected = useMemo(() => (auth ? null : detectAuth(draft)), [draft, auth]);
+
+  const known = new Set(availableVars(ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars).map((v) => v.name));
+  const used = auth ? [auth.token, auth.username, auth.password, auth.value].flatMap((t) => placeholdersIn(t)) : [];
+  const missing = [...new Set(used.filter((n) => !n.startsWith('$') && !known.has(n)))];
+
+  const useDetected = () => {
+    if (!detected) return;
+    setDraft((d) => (d ? { ...stripAuthorization(d, detected.headerValue), auth: detected.auth } : d));
+    toast(`Authentication moved out of ${detected.steps} step(s) into the workflow settings`);
+  };
+
+  return (
+    <Card
+      title="Authentication"
+      hint="Added to every request. Use a value from your login step, e.g. Bearer ${token}. A request is sent without it until that value exists, so the login itself needs no exception."
+    >
+      <div className="stack">
+        <div className="grid-2">
+          <Field label="Method" htmlFor="auth-type">
+            <select
+              id="auth-type"
+              value={auth?.type ?? ''}
+              onChange={(e) => {
+                const type = e.target.value as AuthConfig['type'] | '';
+                setDraft((d) => {
+                  if (!d) return d;
+                  if (!type) {
+                    const { auth: _drop, ...rest } = d;
+                    return rest;
+                  }
+                  const seed: AuthConfig = type === 'bearer' ? { type, token: '${token}' } : type === 'basic' ? { type, username: '${user.username}', password: '${user.password}' } : { type, name: type === 'header' ? 'X-API-Key' : 'api_key', value: '' };
+                  return { ...d, auth: seed };
+                });
+              }}
+            >
+              <option value="">None: only what each request already carries</option>
+              {(Object.keys(AUTH_LABELS) as AuthConfig['type'][]).map((t) => (
+                <option key={t} value={t}>
+                  {AUTH_LABELS[t]}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {detected && (
+            <div className="callout" style={{ alignSelf: 'end' }}>
+              <div>
+                {detected.steps} step(s) send the same <code>Authorization</code> header.
+              </div>
+              <button className="btn small" style={{ marginTop: 6 }} onClick={useDetected}>
+                Use it as the workflow authentication
+              </button>
+            </div>
+          )}
+        </div>
+
+        {auth?.type === 'bearer' && (
+          <Field label="Token" help={<>Usually a value extracted from the login response, e.g. <code>{'${token}'}</code>. “Bearer ” is added for you.</>}>
+            <BindField value={auth.token ?? ''} onChange={(v) => set({ token: v })} ctx={ctx} replace ariaLabel="Bearer token" />
+          </Field>
+        )}
+        {auth?.type === 'basic' && (
+          <div className="grid-2">
+            <Field label="Username">
+              <BindField value={auth.username ?? ''} onChange={(v) => set({ username: v })} ctx={ctx} replace ariaLabel="Basic auth username" />
+            </Field>
+            <Field label="Password">
+              <BindField value={auth.password ?? ''} onChange={(v) => set({ password: v })} ctx={ctx} replace ariaLabel="Basic auth password" />
+            </Field>
+          </div>
+        )}
+        {(auth?.type === 'header' || auth?.type === 'query') && (
+          <div className="grid-2">
+            <Field label={auth.type === 'header' ? 'Header name' : 'Parameter name'}>
+              <input type="text" className="mono" value={auth.name ?? ''} onChange={(e) => set({ name: e.target.value })} />
+            </Field>
+            <Field label="Value">
+              <BindField value={auth.value ?? ''} onChange={(v) => set({ value: v })} ctx={ctx} replace ariaLabel="API key value" />
+            </Field>
+          </div>
+        )}
+
+        {missing.length > 0 && (
+          <div className="callout warn">
+            Nothing in the workflow produces <b>{missing.map((m) => `\${${m}}`).join(', ')}</b>, so requests will go out without authentication. Extract it in your login step
+            (Extract variables → JSON path / header / cookie), or pick it with the <code>{'{ }'}</code> button.
+          </div>
+        )}
+        {auth && <div className="faint" style={{ fontSize: 12.5 }}>Tip: on a step, tick “Do not add authentication” to exclude it. Validate below shows which requests carried it.</div>}
+      </div>
+    </Card>
+  );
+}
+
 /* ================================================================= step editor */
 
 const headersToText = (h?: Record<string, string>) => Object.entries(h ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n');
@@ -214,15 +411,28 @@ const textToHeaders = (t: string) => {
   return out;
 };
 
-function StepEditor({ step, onChange }: { step: Step; onChange: (s: Step) => void }) {
+function StepEditor({ step, ctx, hasAuth, onChange }: { step: Step; ctx: BindContext; hasAuth: boolean; onChange: (s: Step) => void }) {
   const [headersText, setHeadersText] = useState(headersToText(step.request.headers));
+  const [rawBody, setRawBody] = useState(false);
+  const [picking, setPicking] = useState<number | null>(null);
   const set = (patch: Partial<Step>) => onChange({ ...step, ...patch });
   const setReq = (patch: Partial<Step['request']>) => onChange({ ...step, request: { ...step.request, ...patch } });
   const extractors = step.extract ?? [];
   const setEx = (i: number, patch: Partial<Extractor>) => set({ extract: extractors.map((e, j) => (j === i ? { ...e, ...patch } : e)) });
 
+  const url = splitUrl(step.request.url);
+  const body = step.request.body;
+  const kind = detectBodyKind(body, step.request.headers);
+  const jFields = kind === 'json' && body !== undefined ? jsonFields(body) : null;
+  const missing = unresolvedVars(ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars);
+
   return (
     <div className="step-edit">
+      {missing.length > 0 && (
+        <div className="callout warn">
+          This request uses <b>{missing.map((m) => `\${${m}}`).join(', ')}</b>, which no earlier step provides. Extract it from an earlier response (use the <code>{'{ }'}</code> button on a field), or fix the name.
+        </div>
+      )}
       <div className="grid-2">
         <Field label="Step name">
           <input type="text" value={step.name} onChange={(e) => set({ name: e.target.value })} />
@@ -241,27 +451,62 @@ function StepEditor({ step, onChange }: { step: Step; onChange: (s: Step) => voi
             </select>
           </Field>
         </div>
-        <div style={{ flex: 1 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
           <Field label="URL">
-            <input type="text" className="mono" value={step.request.url} onChange={(e) => setReq({ url: e.target.value })} />
+            <BindField value={step.request.url} onChange={(v) => setReq({ url: v })} ctx={ctx} ariaLabel="URL" />
           </Field>
         </div>
       </div>
-      <div className="grid-2">
-        <Field label="Headers" help="One per line: Name: value">
-          <textarea
-            rows={5}
-            value={headersText}
-            onChange={(e) => {
-              setHeadersText(e.target.value);
-              setReq({ headers: textToHeaders(e.target.value) });
-            }}
+
+      <Section title="Query parameters" hint="Each value can be typed, or taken from an earlier step's response, the users file or a generator.">
+        <ParamTable
+          what="parameter"
+          ctx={ctx}
+          params={url.params}
+          onChange={(params) => setReq({ url: joinUrl(url.base, params, url.hash) })}
+        />
+      </Section>
+
+      <Section title="Body">
+        {kind === 'json' && jFields && !rawBody ? (
+          <JsonFieldTable
+            ctx={ctx}
+            fields={jFields}
+            onSet={(f, v) => setReq({ body: setJsonField(body ?? '', f.tokens, v) })}
           />
-        </Field>
-        <Field label="Body">
-          <textarea rows={5} value={step.request.body ?? ''} onChange={(e) => setReq({ body: e.target.value || undefined })} />
-        </Field>
-      </div>
+        ) : kind === 'form' && !rawBody ? (
+          <ParamTable what="field" ctx={ctx} params={formFields(body ?? '')} onChange={(p) => setReq({ body: joinForm(p) || undefined })} />
+        ) : (
+          <BindField rows={6} value={body ?? ''} onChange={(v) => setReq({ body: v || undefined })} ctx={ctx} ariaLabel="Request body" />
+        )}
+        {(kind === 'json' || kind === 'form') && (
+          <div style={{ marginTop: 6 }}>
+            <button className="btn small ghost" onClick={() => setRawBody(!rawBody)}>
+              {rawBody ? 'Edit as fields' : 'Edit as text'}
+            </button>
+          </div>
+        )}
+      </Section>
+
+      <Field label="Headers" help="One per line: Name: value. Use { } to insert a value from another step.">
+        <BindField
+          rows={5}
+          value={headersText}
+          onChange={(v) => {
+            setHeadersText(v);
+            setReq({ headers: textToHeaders(v) });
+          }}
+          ctx={ctx}
+          ariaLabel="Headers"
+        />
+      </Field>
+
+      {hasAuth && (
+        <label className="check">
+          <input type="checkbox" checked={!!step.skipAuth} onChange={(e) => set({ skipAuth: e.target.checked || undefined })} />
+          Do not add the workflow authentication to this step
+        </label>
+      )}
 
       <div>
         <div className="section-title">Assertions</div>
@@ -284,11 +529,14 @@ function StepEditor({ step, onChange }: { step: Step; onChange: (s: Step) => voi
       </div>
 
       <div>
-        <div className="section-title">Extract variables from the response</div>
+        <div className="section-title">Save values from this response for later steps</div>
+        <div className="faint" style={{ fontSize: 12.5, margin: '-4px 0 8px' }}>
+          Later steps can then use them as <code>{'${name}'}</code>: in the URL, parameters, body, headers or authentication.
+        </div>
         {extractors.map((ex, i) => (
           <div className="row" key={i} style={{ flexWrap: 'nowrap', marginBottom: 6 }}>
-            <input type="text" className="mono" style={{ maxWidth: 150 }} placeholder="variable" value={ex.var} onChange={(e) => setEx(i, { var: e.target.value })} />
-            <select style={{ maxWidth: 130 }} value={ex.from} onChange={(e) => setEx(i, { from: e.target.value as Extractor['from'] })}>
+            <input type="text" className="mono" style={{ maxWidth: 150 }} placeholder="variable" aria-label="Variable name" value={ex.var} onChange={(e) => setEx(i, { var: e.target.value })} />
+            <select style={{ maxWidth: 130 }} aria-label="Where to read it" value={ex.from} onChange={(e) => setEx(i, { from: e.target.value as Extractor['from'] })}>
               <option value="body">JSON path</option>
               <option value="header">Header</option>
               <option value="cookie">Cookie</option>
@@ -300,10 +548,14 @@ function StepEditor({ step, onChange }: { step: Step; onChange: (s: Step) => voi
                 type="text"
                 className="mono"
                 placeholder={ex.from === 'body' ? '$.data.token' : ex.from === 'regex' ? 'id="(\\d+)"' : 'name'}
+                aria-label="Location"
                 value={(ex.from === 'body' ? ex.path : ex.from === 'regex' ? ex.regex : ex.name) ?? ''}
                 onChange={(e) => setEx(i, ex.from === 'body' ? { path: e.target.value } : ex.from === 'regex' ? { regex: e.target.value } : { name: e.target.value })}
               />
             )}
+            <button className="btn small" title="Choose from the recorded response of this step" onClick={() => setPicking(i)} disabled={step.sourceId === undefined}>
+              Pick…
+            </button>
             <label className="check" title="Do not fail the step when nothing matches">
               <input type="checkbox" checked={!!ex.optional} onChange={(e) => setEx(i, { optional: e.target.checked || undefined })} /> optional
             </label>
@@ -313,9 +565,25 @@ function StepEditor({ step, onChange }: { step: Step; onChange: (s: Step) => voi
           </div>
         ))}
         <button className="btn small ghost" onClick={() => set({ extract: [...extractors, { var: '', from: 'body', path: '$.' }] })}>
-          + Add extractor
+          + Add value to save
         </button>
       </div>
+
+      {picking !== null && step.sourceId !== undefined && (
+        <PickExtractorDialog
+          testId={ctx.testId}
+          sourceId={step.sourceId}
+          onClose={() => setPicking(null)}
+          onPick={(e) => {
+            const cur = extractors[picking];
+            const { var: suggested, ...where } = e;
+            const patch: Partial<Extractor> = { path: undefined, name: undefined, regex: undefined, group: undefined, ...where };
+            if (cur && !cur.var.trim()) patch.var = suggested;
+            setEx(picking, patch);
+            setPicking(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -325,14 +593,20 @@ function StepList({
   hint,
   steps,
   phase,
+  wf,
+  ctxFor,
   onChange,
+  onEdit,
   onMovePhase,
 }: {
   title: string;
   hint: string;
   steps: Step[];
   phase: 'setup' | 'steps';
+  wf: Workflow;
+  ctxFor: (ref: StepRef) => BindContext;
   onChange: (steps: Step[]) => void;
+  onEdit: (index: number, step: Step) => void;
   onMovePhase: (index: number) => void;
 }) {
   const [open, setOpen] = useState<number | null>(null);
@@ -344,6 +618,7 @@ function StepList({
     onChange(copy);
     setOpen(open === i ? j : open);
   };
+  const first = ctxFor({ phase, index: 0 });
   return (
     <div>
       <div className="row between" style={{ marginBottom: 8 }}>
@@ -355,45 +630,57 @@ function StepList({
         </div>
       </div>
       {steps.length === 0 && <div className="faint" style={{ padding: '8px 0' }}>No steps.</div>}
-      {steps.map((s, i) => (
-        <div className="step-row" key={i}>
-          <div className="step-head" onClick={() => setOpen(open === i ? null : i)}>
-            <span className="faint num" style={{ width: 20 }}>
-              {i + 1}
-            </span>
-            <MethodTag method={s.request.method} />
-            <span className="name" title={s.request.url}>
-              {s.name.startsWith(`${s.request.method.toUpperCase()} `) ? s.name.slice(s.request.method.length + 1) : s.name}
-            </span>
-            {(s.thinkTimeMs ?? 0) > 0 && <span className="chip">⏱ {fmt.ms(s.thinkTimeMs)}</span>}
-            {(s.extract?.length ?? 0) > 0 && <span className="chip">⇢ {s.extract!.map((e) => e.var).join(', ')}</span>}
-            {s.expect && (s.expect.status || s.expect.bodyContains) && <span className="chip">✓ assert</span>}
-            {s.cache && <span className="chip">shared</span>}
-            <div className="row" style={{ flexWrap: 'nowrap', gap: 2 }} onClick={(e) => e.stopPropagation()}>
-              <button className="btn icon ghost" title="Move up" onClick={() => move(i, -1)} disabled={i === 0}>
-                ↑
-              </button>
-              <button className="btn icon ghost" title="Move down" onClick={() => move(i, 1)} disabled={i === steps.length - 1}>
-                ↓
-              </button>
-              <button className="btn small ghost" title={phase === 'setup' ? 'Run every iteration instead' : 'Run once per virtual user instead'} onClick={() => onMovePhase(i)}>
-                {phase === 'setup' ? '→ iteration' : '→ setup'}
-              </button>
-              <button
-                className="btn icon ghost danger"
-                title="Delete step"
-                onClick={() => {
-                  onChange(steps.filter((_, j) => j !== i));
-                  setOpen(null);
-                }}
-              >
-                ✕
-              </button>
+      {steps.map((s, i) => {
+        const ref: StepRef = { phase, index: i };
+        const uses = usedStepVars(wf, s);
+        const unresolved = unresolvedVars(wf, ref, first.userColumns, first.extraVars);
+        return (
+          <div className="step-row" key={i}>
+            <div className="step-head" onClick={() => setOpen(open === i ? null : i)}>
+              <span className="faint num" style={{ width: 20 }}>
+                {i + 1}
+              </span>
+              <MethodTag method={s.request.method} />
+              <span className="name" title={s.request.url}>
+                {s.name.startsWith(`${s.request.method.toUpperCase()} `) ? s.name.slice(s.request.method.length + 1) : s.name}
+              </span>
+              {s.resourceType && !['xhr', 'fetch'].includes(s.resourceType) && <span className="chip">{s.resourceType === 'script' ? 'js' : s.resourceType}</span>}
+              {(s.thinkTimeMs ?? 0) > 0 && <span className="chip">⏱ {fmt.ms(s.thinkTimeMs)}</span>}
+              {uses.length > 0 && <span className="chip" title="Values this request takes from earlier steps">⇠ {uses.join(', ')}</span>}
+              {(s.extract?.length ?? 0) > 0 && <span className="chip" title="Values saved for later steps">⇢ {s.extract!.map((e) => e.var).join(', ')}</span>}
+              {unresolved.length > 0 && (
+                <span className="badge warn" title={`No earlier step provides ${unresolved.join(', ')}`}>
+                  ⚠ {unresolved.length} missing
+                </span>
+              )}
+              {s.expect && (s.expect.status || s.expect.bodyContains) && <span className="chip">✓ assert</span>}
+              {s.cache && <span className="chip">shared</span>}
+              <div className="row" style={{ flexWrap: 'nowrap', gap: 2 }} onClick={(e) => e.stopPropagation()}>
+                <button className="btn icon ghost" title="Move up" onClick={() => move(i, -1)} disabled={i === 0}>
+                  ↑
+                </button>
+                <button className="btn icon ghost" title="Move down" onClick={() => move(i, 1)} disabled={i === steps.length - 1}>
+                  ↓
+                </button>
+                <button className="btn small ghost" title={phase === 'setup' ? 'Run every iteration instead' : 'Run once per virtual user instead'} onClick={() => onMovePhase(i)}>
+                  {phase === 'setup' ? '→ iteration' : '→ setup'}
+                </button>
+                <button
+                  className="btn icon ghost danger"
+                  title="Delete step"
+                  onClick={() => {
+                    onChange(steps.filter((_, j) => j !== i));
+                    setOpen(null);
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
+            {open === i && <StepEditor step={s} ctx={ctxFor(ref)} hasAuth={!!wf.auth} onChange={(ns) => onEdit(i, ns)} />}
           </div>
-          {open === i && <StepEditor step={s} onChange={(ns) => onChange(steps.map((x, j) => (j === i ? ns : x)))} />}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -402,13 +689,18 @@ function StepList({
 
 function ValidatePanel({ test, dirty }: TabProps & { dirty: boolean }) {
   const { busy, run } = useAction();
+  const [openCall, setOpenCall] = useState<Set<number>>(new Set());
   const [userIndex, setUserIndex] = useState(0);
   const [iterations, setIterations] = useState(1);
   const [result, setResult] = useState<ValidationResult | null>(null);
+  const hasAuth = !!test.workflow?.auth;
 
   const go = async () => {
     const r = await run(() => api.validateWorkflow(test.id, { userIndex, iterations }));
-    if (r) setResult(r);
+    if (r) {
+      setResult(r);
+      setOpenCall(new Set(r.traces.flatMap((t, i) => (t.error ? [i] : []))));
+    }
   };
 
   return (
@@ -448,7 +740,7 @@ function ValidatePanel({ test, dirty }: TabProps & { dirty: boolean }) {
           </div>
           {result.traces.map((t, i) => (
             <div key={i} className={`trace ${t.error ? 'fail' : 'ok'}`}>
-              <div className="row" style={{ flexWrap: 'nowrap' }}>
+              <div className="row" style={{ flexWrap: 'nowrap', cursor: t.call ? 'pointer' : undefined }} onClick={() => t.call && setOpenCall((s) => { const n = new Set(s); if (!n.delete(i)) n.add(i); return n; })}>
                 <span className="faint" style={{ width: 80, fontSize: 12 }}>
                   {t.phase}
                 </span>
@@ -456,9 +748,22 @@ function ValidatePanel({ test, dirty }: TabProps & { dirty: boolean }) {
                 <span className="mono" style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {t.step}
                 </span>
+                {hasAuth && t.auth === 'applied' && <span className="badge info" title="The workflow authentication was sent with this request">🔑 auth</span>}
+                {hasAuth && t.auth === 'skipped' && (
+                  <span className="badge warn" title="The authentication value was not available yet (e.g. before the login step) so nothing was added">
+                    no auth yet
+                  </span>
+                )}
+                {hasAuth && t.auth === 'own' && <span className="badge" title="This request sets its own credentials">own auth</span>}
                 <span className="muted num">{fmt.ms(t.durationMs)}</span>
+                {t.call && <span className="faint">{openCall.has(i) ? '▾ details' : '▸ details'}</span>}
               </div>
-              {Object.keys(t.extracted).length > 0 && (
+              {t.call && openCall.has(i) && (
+                <div style={{ marginLeft: 88, marginTop: 6 }}>
+                  <CallDetail call={t.call} />
+                </div>
+              )}
+              {!openCall.has(i) && Object.keys(t.extracted).length > 0 && (
                 <div className="mono faint" style={{ marginLeft: 88, fontSize: 12 }}>
                   {Object.entries(t.extracted).map(([k, v]) => (
                     <div key={k}>
@@ -486,6 +791,11 @@ function ValidatePanel({ test, dirty }: TabProps & { dirty: boolean }) {
 
 /* ================================================================= tab */
 
+const mapStep = (wf: Workflow, ref: StepRef, fn: (s: Step) => Step): Workflow => ({
+  ...wf,
+  [ref.phase]: wf[ref.phase].map((s, i) => (i === ref.index ? fn(s) : s)),
+});
+
 export function WorkflowTab(props: TabProps) {
   const { test, reload } = props;
   const toast = useToast();
@@ -495,11 +805,19 @@ export function WorkflowTab(props: TabProps) {
   const [jsonText, setJsonText] = useState('');
   const saved = JSON.stringify(test.workflow);
   const dirty = useMemo(() => (jsonMode ? jsonText !== JSON.stringify(test.workflow, null, 2) : JSON.stringify(draft) !== saved), [draft, saved, jsonMode, jsonText, test.workflow]);
+  const userColumns = useMemo(() => test.dataset?.columns ?? [], [test.dataset]);
+  const extraVars = useMemo(() => Object.keys(test.settings.variables ?? {}), [test.settings.variables]);
 
   useEffect(() => {
     setDraft(test.workflow);
     setJsonText(JSON.stringify(test.workflow, null, 2));
   }, [saved]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // All draft updates are functional so a binding (which edits two steps at once) never overwrites itself.
+  const editStep = (ref: StepRef, ns: Step) => setDraft((d) => (d ? mapStep(d, ref, () => ns) : d));
+  const addExtractor = (source: StepRef, ex: Extractor) =>
+    setDraft((d) => (d ? mapStep(d, source, (s) => ((s.extract ?? []).some((e) => e.var === ex.var) ? s : { ...s, extract: [...(s.extract ?? []), ex] })) : d));
+  const ctxFor = (ref: StepRef): BindContext => ({ testId: test.id, workflow: draft!, ref, userColumns, extraVars, addExtractor });
 
   const save = async () => {
     let wf = draft;
@@ -534,6 +852,7 @@ export function WorkflowTab(props: TabProps) {
   return (
     <div className="stack">
       <BuildPanel {...props} dirty={dirty} />
+      {draft && !jsonMode && <AuthPanel draft={draft} setDraft={setDraft} ctx={ctxFor({ phase: 'steps', index: draft.steps.length })} />}
       {draft && (
         <Card
           title="Steps"
@@ -571,7 +890,10 @@ export function WorkflowTab(props: TabProps) {
                 hint="Typically the login. Values extracted here (tokens, session) are reused by every iteration."
                 steps={draft.setup}
                 phase="setup"
+                wf={draft}
+                ctxFor={ctxFor}
                 onChange={(setup) => setDraft({ ...draft, setup })}
+                onEdit={(i, s) => editStep({ phase: 'setup', index: i }, s)}
                 onMovePhase={(i) => setDraft({ ...draft, setup: draft.setup.filter((_, j) => j !== i), steps: [draft.setup[i], ...draft.steps] })}
               />
               <StepList
@@ -579,7 +901,10 @@ export function WorkflowTab(props: TabProps) {
                 hint="The business transaction each virtual user performs over and over."
                 steps={draft.steps}
                 phase="steps"
+                wf={draft}
+                ctxFor={ctxFor}
                 onChange={(steps) => setDraft({ ...draft, steps })}
+                onEdit={(i, s) => editStep({ phase: 'steps', index: i }, s)}
                 onMovePhase={(i) => setDraft({ ...draft, steps: draft.steps.filter((_, j) => j !== i), setup: [...draft.setup, draft.steps[i]] })}
               />
               <div>

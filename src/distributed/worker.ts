@@ -148,6 +148,7 @@ export class LoadWorker {
           user: await this.pickUser(ctx, job.vuIndex),
           vuIndex: job.vuIndex,
           metrics: ctx.collector,
+          sampler: ctx.collector,
           cache: ctx.cache,
           requestTimeoutMs: cfg.requestTimeoutMs,
           thinkTimeScale: cfg.thinkTimeScale,
@@ -205,7 +206,7 @@ export class LoadWorker {
         const ctx: RunContext = {
           runId,
           ...run,
-          collector: new MetricsCollector(),
+          collector: new MetricsCollector(run.config.capture),
           cache: this.state.sharedCache(runId),
           stopped: await this.state.isStopped(runId),
           refs: 0,

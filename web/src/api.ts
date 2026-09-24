@@ -1,8 +1,12 @@
 import type {
   BuildOptionsInput,
   BuildReport,
+  CallSample,
+  CaptureSettings,
+  StepRequest,
   DatasetView,
   RecordingView,
+  ResponseSample,
   RunDetails,
   RunRow,
   SystemStatus,
@@ -65,6 +69,7 @@ export const api = {
 
   suggestUserFields: (id: string) => request<{ userFields: Record<string, string> }>('GET', `/tests/${enc(id)}/workflow/suggest-user-fields`),
   buildWorkflow: (id: string, opts: BuildOptionsInput) => request<{ workflow: Workflow; report: BuildReport }>('POST', `/tests/${enc(id)}/workflow/build`, opts),
+  responseSample: (id: string, exchangeId: number) => request<ResponseSample>('GET', `/tests/${enc(id)}/workflow/response-sample/${exchangeId}`),
   saveWorkflow: (id: string, wf: Workflow) => request<{ workflow: Workflow }>('PUT', `/tests/${enc(id)}/workflow`, wf),
   validateWorkflow: (id: string, b: { userIndex: number; iterations: number }) => request<ValidationResult>('POST', `/tests/${enc(id)}/workflow/validate`, b),
 
@@ -76,6 +81,7 @@ export const api = {
   getRun: (id: string) => request<RunDetails>('GET', `/runs/${enc(id)}`),
   stopRun: (id: string) => request<void>('POST', `/runs/${enc(id)}/stop`),
   deleteRun: (id: string) => request<void>('DELETE', `/runs/${enc(id)}`),
+  runSamples: (id: string) => request<{ capture: CaptureSettings | null; steps: { name: string; request: StepRequest }[]; samples: CallSample[] }>('GET', `/runs/${enc(id)}/samples`),
   runEventsUrl: (id: string) => `/api/runs/${enc(id)}/events`,
   reportUrl: (id: string, kind: 'report.html' | 'report.json' | 'junit.xml') => `/api/runs/${enc(id)}/${kind}`,
 };

@@ -35,6 +35,25 @@ export interface Recording {
   userFields?: Record<string, string>;
 }
 
+/** What a recorded response contained: values a later request can bind to. Served to the workflow editor. */
+export interface ResponseSample {
+  id: number;
+  method: string;
+  url: string;
+  status?: number;
+  mimeType?: string;
+  /** JSON leaves (strings / numbers) that can be extracted with a JSON path */
+  jsonPaths: { path: string; value: string }[];
+  /** response headers (lower-cased names) that can be extracted */
+  headers: { name: string; value: string }[];
+  /** cookies set by the response */
+  cookies: { name: string; value: string }[];
+  /** hidden form fields / csrf meta tags found in an HTML response, with a ready-made regex */
+  htmlFields: { name: string; value: string; regex: string }[];
+  bodyPreview: string;
+  truncated: boolean;
+}
+
 /** ---------- Workflow (what the engine executes) ---------- */
 
 export type ExtractorSource = 'body' | 'header' | 'cookie' | 'regex' | 'status';
@@ -63,6 +82,12 @@ export interface Step {
   name: string;
   /** logical page / transaction the step belongs to */
   group?: string;
+  /** Playwright resource type the request was recorded as (document, xhr, fetch, script, ...) */
+  resourceType?: string;
+  /** id of the recorded exchange this step came from (lets the UI show the recorded response) */
+  sourceId?: number;
+  /** do not add the workflow-level authentication to this step (e.g. the login call itself) */
+  skipAuth?: boolean;
   request: StepRequest;
   extract?: Extractor[];
   expect?: { status?: number[]; bodyContains?: string };
@@ -76,17 +101,74 @@ export interface Step {
   cache?: { key: string; ttlSec: number; vars: string[] };
 }
 
+/**
+ * Authentication added to every request. Values are templates (${token}, ${user.password}, ...).
+ * If a referenced variable is not available yet (e.g. before the login step ran), the request is sent
+ * without it. A step that sets its own Authorization header (or skipAuth) is left untouched.
+ */
+export interface AuthConfig {
+  type: 'bearer' | 'basic' | 'header' | 'query';
+  /** bearer: the token */
+  token?: string;
+  /** basic: credentials */
+  username?: string;
+  password?: string;
+  /** header / query: parameter name and value (API key style) */
+  name?: string;
+  value?: string;
+}
+
 export interface Workflow {
   name: string;
   /** default variables; ${baseUrl} is conventional */
   variables: Record<string, string>;
   defaults?: { headers?: Record<string, string> };
+  auth?: AuthConfig;
   /** runs once per virtual user (e.g. login) */
   setup: Step[];
   /** runs every iteration */
   steps: Step[];
   /** what to do when a step fails: abort the current iteration (default) or continue */
   onError?: 'abortIteration' | 'continue';
+}
+
+/** ---------- Call details (samples shown in validation and reports) ---------- */
+
+/** How much detail a run keeps about individual calls. Every request is counted; only samples keep full details. */
+export interface CaptureSettings {
+  /** successful calls kept per step (0 = none) */
+  okSamples: number;
+  /** failed calls kept per step (0 = none) */
+  errorSamples: number;
+  /** response/request bodies are cut after this many KB */
+  bodyKb: number;
+  /** hide credentials (Authorization/Cookie headers, password and token fields) in the stored details */
+  maskSecrets: boolean;
+}
+
+export const DEFAULT_CAPTURE: CaptureSettings = { okSamples: 3, errorSamples: 5, bodyKb: 16, maskSecrets: true };
+
+/** Everything about one call: what was sent, what came back, and what was extracted from it. */
+export interface CallSample {
+  step: string;
+  outcome: 'ok' | 'error';
+  phase: 'setup' | 'iteration';
+  /** epoch ms when the call started */
+  at: number;
+  vu: number;
+  iteration: number;
+  durationMs: number;
+  request: { method: string; url: string; headers: Record<string, string>; body?: string; bodyTruncated?: boolean };
+  response?: { status: number; headers: Record<string, string>; body?: string; bodyTruncated?: boolean; bytes: number };
+  /** redirect hops followed before the final response */
+  redirects?: { status: number; url: string }[];
+  error?: string;
+  /** values this call saved for later steps */
+  extracted: Record<string, string>;
+  /** workflow authentication: applied, skipped (value not available yet) or own (the step sets it) */
+  auth?: 'applied' | 'skipped' | 'own';
+  /** true when secrets in this sample were masked */
+  masked?: boolean;
 }
 
 /** ---------- Distributed run ---------- */
@@ -103,6 +185,8 @@ export interface RunConfig {
   usersCount: number;
   thinkTimeScale: number;
   requestTimeoutMs: number;
+  /** per-call detail capture; absent on runs started before this existed */
+  capture?: CaptureSettings;
   /** epoch ms at which VU #0 starts */
   startAt: number;
   /** epoch ms after which no new iteration starts */
@@ -144,6 +228,8 @@ export interface TestSettings {
   baseUrl?: string;
   variables: Record<string, string>;
   thresholds: Threshold[];
+  /** how many calls per step are kept with full request/response details; DEFAULT_CAPTURE when absent */
+  capture?: CaptureSettings;
 }
 
 export const DEFAULT_SETTINGS: TestSettings = {

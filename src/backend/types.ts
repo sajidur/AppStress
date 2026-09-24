@@ -1,7 +1,7 @@
 import type { SharedCache } from '../engine/executor.js';
 import type { Snapshot } from '../metrics/collector.js';
 import type { RunStats } from '../metrics/stats.js';
-import type { RunConfig, VuJob, Workflow } from '../types.js';
+import type { CallSample, RunConfig, VuJob, Workflow } from '../types.js';
 
 export type BackendMode = 'memory' | 'distributed';
 
@@ -43,6 +43,8 @@ export interface StateBackend {
 
   flushMetrics(runId: string, snap: Snapshot): Promise<void>;
   loadStats(runId: string, stepOrder?: string[]): Promise<RunStats>;
+  /** calls kept with full request/response details (at most the run's capture limits per step) */
+  loadSamples(runId: string): Promise<CallSample[]>;
 
   sharedCache(runId: string): SharedCache;
 

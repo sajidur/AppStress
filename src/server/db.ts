@@ -3,13 +3,15 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { BuildReport } from '../builder/builder.js';
 import type { RunStats } from '../metrics/stats.js';
-import type { Recording, RunConfig, TestSettings, ThresholdResult, Verdict, Workflow } from '../types.js';
+import type { CallSample, Recording, RunConfig, TestSettings, ThresholdResult, Verdict, Workflow } from '../types.js';
 
 /* ------------------------------------------------------------------ row types */
 
 export interface BuildOptionsInput {
   userFields: Record<string, string>;
   includeDocuments: boolean;
+  /** request types that count as test steps (document, xhr, script, ...); overrides includeDocuments */
+  resourceTypes?: string[];
   domains: string[];
   exclude: string[];
   minThinkMs: number;
@@ -120,6 +122,8 @@ const MIGRATIONS: string[] = [
    );
    CREATE INDEX runs_by_test ON runs(test_id, created_at DESC);
    CREATE INDEX runs_by_status ON runs(status);`,
+  // full request/response details of sampled calls (JSON array of CallSample)
+  `ALTER TABLE runs ADD COLUMN samples TEXT;`,
 ];
 
 const json = <T>(v: unknown): T | null => (v === null || v === undefined ? null : (JSON.parse(String(v)) as T));
@@ -330,7 +334,7 @@ export class Store {
 
   updateRun(
     id: string,
-    patch: Partial<{ status: RunStatus; verdict: Verdict; config: RunConfig; summary: RunSummary; stats: RunStats; thresholds: ThresholdResult[]; error: string; startedAt: number; finishedAt: number }>,
+    patch: Partial<{ status: RunStatus; verdict: Verdict; config: RunConfig; summary: RunSummary; stats: RunStats; samples: CallSample[]; thresholds: ThresholdResult[]; error: string; startedAt: number; finishedAt: number }>,
   ) {
     const cols: Record<string, string> = {
       status: 'status',
@@ -338,6 +342,7 @@ export class Store {
       config: 'config',
       summary: 'summary',
       stats: 'stats',
+      samples: 'samples',
       thresholds: 'thresholds',
       error: 'error',
       startedAt: 'started_at',
@@ -365,6 +370,12 @@ export class Store {
   getRunDetails(id: string): { stats: RunStats | null; workflow: Workflow } | null {
     const r = this.db.prepare('SELECT stats, workflow FROM runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     return r ? { stats: json<RunStats>(r.stats), workflow: json<Workflow>(r.workflow)! } : null;
+  }
+
+  /** Calls kept with full request/response details, or [] when the run has none. */
+  getRunSamples(id: string): CallSample[] {
+    const r = this.db.prepare('SELECT samples FROM runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return json<CallSample[]>(r?.samples) ?? [];
   }
 
   listRuns(filter: { testId?: string; limit?: number; statuses?: RunStatus[] } = {}): RunRow[] {

@@ -6,7 +6,14 @@ export interface BuildOptions {
   name?: string;
   /** hosts to keep (suffix match); default: the start URL's site domain, e.g. example.com (covers www., api., ...) */
   domains?: string[];
-  includeDocuments: boolean;
+  /** legacy switch, only used when resourceTypes is not given: xhr+fetch, plus document when true */
+  includeDocuments?: boolean;
+  /**
+   * Which recorded request types count as part of the test (Playwright resource types:
+   * document, xhr, fetch, script, stylesheet, image, font, media, other).
+   * Default: document + xhr + fetch.
+   */
+  resourceTypes?: string[];
   /** regexes; matching URLs are dropped */
   exclude: string[];
   /** literal values typed while recording -> become ${user.<field>} */
@@ -32,6 +39,18 @@ const DROP_HEADERS = new Set([
   'priority', 'if-none-match', 'if-modified-since', 'cache-control', 'pragma', 'keep-alive', 'te', 'dnt',
 ]);
 const STATIC_EXT = /\.(js|mjs|css|png|jpe?g|gif|svg|ico|woff2?|ttf|otf|eot|map|webp|avif|mp4|webm|mp3)(\?|$)/i;
+/** Types that are static assets by nature: when the user selects them, the file-extension filter must not drop them. */
+const ASSET_TYPES = new Set(['script', 'stylesheet', 'image', 'font', 'media', 'other']);
+
+/** Effective set of request types that become workflow steps. 'xhr' and 'fetch' are always selected together. */
+export function effectiveResourceTypes(opts: Pick<BuildOptions, 'resourceTypes' | 'includeDocuments'>): Set<string> {
+  const types = new Set((opts.resourceTypes ?? ['xhr', 'fetch', ...(opts.includeDocuments === false ? [] : ['document'])]).map((t) => t.toLowerCase()));
+  if (types.has('xhr') || types.has('fetch')) {
+    types.add('xhr');
+    types.add('fetch');
+  }
+  return types;
+}
 const TOKEN_HEADER = /token|csrf|xsrf|auth|session/i;
 
 /**
@@ -93,7 +112,7 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
   const origin = new URL(rec.startUrl).origin;
   const domains = opts.domains?.length ? opts.domains : [siteDomain(new URL(rec.startUrl).hostname)];
   const exclude = opts.exclude.map((r) => new RegExp(r, 'i'));
-  const allowedTypes = new Set(['xhr', 'fetch', ...(opts.includeDocuments ? ['document'] : [])]);
+  const allowedTypes = effectiveResourceTypes(opts);
 
   const kept = rec.exchanges.filter((ex) => {
     if (!ex.response || ex.failure) return false;
@@ -101,7 +120,7 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
     if (!allowedTypes.has(ex.resourceType)) return false;
     const u = new URL(ex.request.url);
     if (!domains.some((d) => u.hostname === d || u.hostname.endsWith('.' + d))) return false;
-    if (STATIC_EXT.test(u.pathname)) return false;
+    if (!ASSET_TYPES.has(ex.resourceType) && STATIC_EXT.test(u.pathname)) return false;
     if (!opts.keepTracking && TRACKING_PATTERNS.some((r) => r.test(ex.request.url))) return false;
     return !exclude.some((r) => r.test(ex.request.url));
   });
@@ -215,6 +234,8 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
     const step: Step = {
       name: uniqueStepName(stepNames, stepName(ex.request.method, url)),
       group: pageGroup(ex, origin),
+      resourceType: ex.resourceType,
+      sourceId: ex.id,
       request: {
         method: ex.request.method,
         url,

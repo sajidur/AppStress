@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../../api';
 import { Card, Field, fmt, useAction } from '../../components/ui';
 import { useAsync } from '../../hooks';
 import { METRICS, metricInfo } from '../../thresholds';
-import type { TestSettings, Threshold, ThresholdOp, UsersMode } from '../../types';
+import type { CaptureSettings, TestSettings, Threshold, ThresholdOp, UsersMode } from '../../types';
+
+const DEFAULT_CAPTURE: CaptureSettings = { okSamples: 3, errorSamples: 5, bodyKb: 16, maskSecrets: true };
 import type { TabProps } from '../TestPage';
 
 const USERS_MODES: { value: UsersMode; label: string; help: string }[] = [
@@ -14,9 +16,10 @@ const USERS_MODES: { value: UsersMode; label: string; help: string }[] = [
 ];
 
 function NumberField({ label, help, value, onChange, min = 0, step = 1 }: { label: string; help?: string; value: number; onChange: (v: number) => void; min?: number; step?: number }) {
+  const id = useId();
   return (
-    <Field label={label} help={help}>
-      <input type="number" min={min} step={step} value={Number.isFinite(value) ? value : ''} onChange={(e) => onChange(e.target.value === '' ? NaN : Number(e.target.value))} />
+    <Field label={label} help={help} htmlFor={id}>
+      <input id={id} type="number" min={min} step={step} value={Number.isFinite(value) ? value : ''} onChange={(e) => onChange(e.target.value === '' ? NaN : Number(e.target.value))} />
     </Field>
   );
 }
@@ -131,6 +134,30 @@ export function SettingsTab({ test, reload }: TabProps) {
             </button>
           </div>
         </div>
+      </Card>
+
+      <Card
+        title="Call details in reports"
+        hint="Every request is counted in the numbers. Full details (URL, headers, body, response) are kept only for a few calls per step, so runs with millions of requests stay small."
+      >
+        {(() => {
+          const cap = s.capture ?? DEFAULT_CAPTURE;
+          const setCap = (patch: Partial<CaptureSettings>) => set({ capture: { ...cap, ...patch } });
+          return (
+            <div className="stack">
+              <div className="grid-3">
+                <NumberField label="Successful calls kept per step" help="The first ones of each step. 0 = none." value={cap.okSamples} onChange={(v) => setCap({ okSamples: v })} />
+                <NumberField label="Failed calls kept per step" help="Failures are what you debug, so keep more of them." value={cap.errorSamples} onChange={(v) => setCap({ errorSamples: v })} />
+                <NumberField label="Cut bodies after (KB)" help="Long request and response bodies are cut here." value={cap.bodyKb} min={1} onChange={(v) => setCap({ bodyKb: v })} />
+              </div>
+              <label className="check">
+                <input type="checkbox" checked={cap.maskSecrets} onChange={(e) => setCap({ maskSecrets: e.target.checked })} />
+                Mask credentials (Authorization and Cookie headers, password and token fields)
+              </label>
+              {!cap.maskSecrets && <div className="callout warn">Passwords, tokens and cookies will be stored in the results and included in downloaded reports. Share those reports with care.</div>}
+            </div>
+          );
+        })()}
       </Card>
 
       <Card

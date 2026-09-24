@@ -11,7 +11,7 @@ import { VirtualUser, type StepTrace } from './engine/executor.js';
 import { MetricsCollector } from './metrics/collector.js';
 import { printSummary, writeReports } from './metrics/report.js';
 import { harToRecording } from './recorder/har.js';
-import type { Recording, UsersMode, Workflow } from './types.js';
+import { DEFAULT_CAPTURE, type Recording, type UsersMode, type Workflow } from './types.js';
 import { collect, loadUsers, log, parseKeyValues, readJson } from './util.js';
 
 const program = new Command();
@@ -45,6 +45,7 @@ program
   .option('-x, --exclude <regex>', 'drop requests whose URL matches (repeatable)', collect, [])
   .option('-u, --user-field <field=value>', 'recorded value -> ${user.field} (repeatable; adds to those given at record time)', collect, [])
   .option('--no-documents', 'drop HTML page loads, keep only XHR/fetch API calls')
+  .option('-t, --types <list>', 'request types that count as test steps, comma separated: document,xhr,script,stylesheet,image,font,media,other (default: document,xhr)')
   .option('--no-correlate', 'disable automatic correlation of dynamic values')
   .option('--min-think <ms>', 'ignore pauses shorter than this', (v) => Number(v), 500)
   .option('--max-think <ms>', 'cap recorded pauses', (v) => Number(v), 10000)
@@ -58,6 +59,7 @@ program
       domains: o.domain,
       exclude: o.exclude,
       includeDocuments: o.documents,
+      resourceTypes: o.types ? String(o.types).split(',').map((t: string) => t.trim()).filter(Boolean) : undefined,
       userFields: parseKeyValues(o.userField),
       correlate: o.correlate,
       minThinkMs: o.minThink,
@@ -150,6 +152,10 @@ program
   .option('--run-id <id>', 'custom run id')
   .option('--start-delay <sec>', 'time for workers to pick up jobs before VU #0 starts', (v) => Number(v))
   .option('--report-dir <dir>', 'report output directory', 'reports')
+  .option('--samples <n>', 'successful calls per step kept in full (request, headers, body, response) in the report', (v) => Number(v), DEFAULT_CAPTURE.okSamples)
+  .option('--error-samples <n>', 'failed calls per step kept in full', (v) => Number(v), DEFAULT_CAPTURE.errorSamples)
+  .option('--body-kb <n>', 'cut request/response bodies in the report after this many KB', (v) => Number(v), DEFAULT_CAPTURE.bodyKb)
+  .option('--no-mask', 'show Authorization/Cookie headers and password/token fields in the report instead of masking them')
   .action(async (file: string, o) => {
     const workflow = withVars(readJson<Workflow>(file), parseKeyValues(o.var));
     const local = o.local && !o.distributed;
@@ -167,6 +173,7 @@ program
       usersMode: o.usersMode as UsersMode,
       thinkTimeScale: o.thinkScale,
       requestTimeoutMs: o.timeout,
+      capture: { okSamples: o.samples, errorSamples: o.errorSamples, bodyKb: o.bodyKb, maskSecrets: o.mask },
       runId: o.runId,
       reportDir: o.reportDir,
       startDelaySec: o.startDelay,
@@ -207,7 +214,8 @@ program
     const order = run ? [...run.workflow.setup, ...run.workflow.steps].map((s) => s.name) : [];
     const stats = await backend.state.loadStats(runId, order);
     printSummary(stats);
-    log('report', `Reports: ${writeReports(stats, run?.workflow, o.reportDir).join(', ')}`);
+    const samples = await backend.state.loadSamples(runId);
+    log('report', `Reports: ${writeReports(stats, run?.workflow, o.reportDir, { samples, capture: run?.config.capture }).join(', ')}`);
     await backend.close();
   });
 

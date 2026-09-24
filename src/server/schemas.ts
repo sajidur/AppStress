@@ -26,6 +26,14 @@ export const settingsSchema = z
     baseUrl: z.union([url, z.literal('')]).optional(),
     variables: z.record(z.string().regex(/^[A-Za-z_][\w.]*$/, 'Invalid variable name'), z.string()).default({}),
     thresholds: z.array(thresholdSchema).max(50).default([]),
+    capture: z
+      .object({
+        okSamples: z.number().int().min(0).max(50),
+        errorSamples: z.number().int().min(0).max(200),
+        bodyKb: z.number().int().min(1).max(512),
+        maskSecrets: z.boolean(),
+      })
+      .optional(),
   })
   .strict();
 
@@ -40,6 +48,7 @@ export const updateTestSchema = createTestSchema.partial();
 export const buildOptionsSchema = z.object({
   userFields: z.record(z.string().min(1), z.string()).default({}),
   includeDocuments: z.boolean().default(true),
+  resourceTypes: z.array(z.string().trim().toLowerCase().min(1)).min(1, 'Select at least one request type').optional(),
   domains: z.array(z.string().trim().min(1)).default([]),
   exclude: z
     .array(z.string().min(1))
@@ -65,6 +74,9 @@ const extractorSchema = z.object({
 const stepSchema = z.object({
   name: z.string().min(1).max(300),
   group: z.string().optional(),
+  resourceType: z.string().optional(),
+  sourceId: z.number().int().optional(),
+  skipAuth: z.boolean().optional(),
   request: z.object({
     method: z.string().regex(/^[A-Za-z]+$/),
     url: z.string().min(1),
@@ -82,11 +94,31 @@ const stepSchema = z.object({
   cache: z.object({ key: z.string().min(1), ttlSec: z.number().int().min(1), vars: z.array(z.string()) }).optional(),
 });
 
+const authSchema = z
+  .object({
+    type: z.enum(['bearer', 'basic', 'header', 'query']),
+    token: z.string().optional(),
+    username: z.string().optional(),
+    password: z.string().optional(),
+    name: z.string().optional(),
+    value: z.string().optional(),
+  })
+  .superRefine((a, ctx) => {
+    const need = (ok: boolean, message: string) => ok || ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+    if (a.type === 'bearer') need(!!a.token?.trim(), 'Authentication: the bearer token is required');
+    if (a.type === 'basic') need(!!a.username?.trim(), 'Authentication: the username is required');
+    if (a.type === 'header' || a.type === 'query') {
+      need(!!a.name?.trim(), 'Authentication: the header/parameter name is required');
+      need(!!a.value?.trim(), 'Authentication: the value is required');
+    }
+  });
+
 export const workflowSchema = z
   .object({
     name: z.string().min(1),
     variables: z.record(z.string()),
     defaults: z.object({ headers: z.record(z.string()).optional() }).optional(),
+    auth: authSchema.optional(),
     setup: z.array(stepSchema),
     steps: z.array(stepSchema),
     onError: z.enum(['abortIteration', 'continue']).optional(),

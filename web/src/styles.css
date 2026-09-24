@@ -253,6 +253,8 @@ table.t tr.total td { font-weight: 650; background: var(--surface-2); }
 .toast.error { background: var(--critical); color: #fff; }
 .modal-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / 0.4); display: grid; place-items: center; z-index: 40; padding: 16px; }
 .modal { background: var(--surface); border-radius: 12px; width: min(520px, 100%); box-shadow: 0 20px 60px rgb(0 0 0 / 0.3); }
+.modal.wide { width: min(820px, 100%); max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
+.modal.wide .card-body { overflow-y: auto; min-height: 0; }
 .modal .card-body { display: flex; flex-direction: column; gap: 14px; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--border); }
 .trace { border-left: 3px solid var(--border-strong); padding: 6px 12px; }
@@ -266,3 +268,50 @@ table.t tr.total td { font-weight: 650; background: var(--surface-2); }
 .chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 1px 7px; border-radius: 999px; background: var(--surface-2); color: var(--text-2); font-family: var(--mono); }
 .spinner { width: 16px; height: 16px; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- value binding (use data from another step) ---------- */
+.kind-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px 16px; }
+.check.kind { padding: 4px 0; }
+.check.kind .chip { margin-left: auto; }
+.bind-field { display: flex; gap: 6px; width: 100%; }
+.bind-field > input, .bind-field > textarea { flex: 1; min-width: 0; }
+.var-menu { position: relative; flex: none; }
+.var-pop {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 30; width: min(380px, 86vw); max-height: 320px; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: 0 12px 32px rgb(0 0 0 / 0.22); padding: 6px;
+}
+.var-group { font-size: 11px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-3); padding: 8px 8px 4px; }
+.var-item {
+  display: flex; justify-content: space-between; gap: 12px; width: 100%; text-align: left; border: 0; background: transparent; color: var(--text);
+  padding: 6px 8px; border-radius: 6px; font: inherit; font-size: 13px; cursor: pointer;
+}
+.var-item:hover:not(:disabled), .var-item:focus-visible { background: var(--accent-soft); }
+.var-item:disabled { color: var(--text-3); cursor: not-allowed; }
+.var-item .faint { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.var-item .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.var-item.bind-more { margin-top: 6px; border-top: 1px solid var(--border); border-radius: 0 0 6px 6px; color: var(--accent); font-weight: 600; }
+.json-key { width: 190px; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--text-2); }
+.pick-list { border: 1px solid var(--border); border-radius: 8px; max-height: 300px; overflow-y: auto; }
+.pick-row { display: flex; gap: 14px; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 7px 10px; font: inherit; cursor: pointer; }
+.pick-row:last-child { border-bottom: 0; }
+.pick-row:hover, .pick-row:focus-visible { background: var(--surface-2); }
+.pick-row.on { background: var(--accent-soft); }
+.pick-key { flex: 0 1 46%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+.pick-val { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-size: 12.5px; }
+
+/* ---------- call details (request / response of individual calls) ---------- */
+.call { border: 1px solid var(--border); border-left-width: 3px; border-radius: 8px; background: var(--surface); }
+.call.ok { border-left-color: var(--good); }
+.call.bad { border-left-color: var(--critical); }
+.call-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; width: 100%; text-align: left; border: 0; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding: 8px 12px; cursor: pointer; }
+.call-body { border-top: 1px solid var(--border); padding: 10px 12px 12px; }
+.call-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 900px) { .call-cols { grid-template-columns: 1fr; } }
+.call-h { font-size: 11.5px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-3); margin-bottom: 4px; }
+.call-pre { margin: 0; padding: 8px 10px; background: var(--surface-2); border-radius: 6px; font-family: var(--mono); font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-all; overflow: auto; max-height: 340px; }
+.call-step { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.call-step > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 9px 12px; cursor: pointer; list-style: none; }
+.call-step > summary::-webkit-details-marker { display: none; }
+.call-step-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+.call-step[open] > summary { border-bottom: 1px solid var(--border); }
+.call-def > summary { cursor: pointer; font-size: 12.5px; color: var(--text-3); margin-bottom: 6px; }

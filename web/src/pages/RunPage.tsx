@@ -1,11 +1,12 @@
 import { useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
+import { CallList } from '../components/CallDetail';
 import { TimeChart } from '../components/TimeChart';
-import { Card, ErrorBox, fmt, Loading, StatusBadge, useAction, VerdictBadge } from '../components/ui';
+import { Card, ErrorBox, fmt, Loading, MethodTag, StatusBadge, useAction, VerdictBadge } from '../components/ui';
 import { useAsync, useEventStream } from '../hooks';
 import { describe, evaluate } from '../thresholds';
-import type { RunDetails, RunProgress, RunRow, RunStats, RunStatus, StepStats } from '../types';
+import type { CallSample, RunDetails, RunProgress, RunRow, RunStats, RunStatus, StepStats } from '../types';
 
 type RunEvent = { type: 'status'; status: RunStatus } | { type: 'progress'; progress: RunProgress } | { type: 'finished'; run: RunRow };
 
@@ -20,6 +21,90 @@ function Kpi({ label, value, sub, tone }: { label: string; value: string; sub?: 
       </div>
       {sub && <div className="k-sub">{sub}</div>}
     </div>
+  );
+}
+
+/** Full request/response details of the calls kept for each step. */
+function CallDetails({ runId, status, stats }: { runId: string; status: RunStatus; stats: RunStats }) {
+  const calls = useAsync(() => api.runSamples(runId), [runId, status]);
+  const d = calls.data;
+  const byStep = useMemo(() => {
+    const m = new Map<string, CallSample[]>();
+    for (const s of d?.samples ?? []) m.set(s.step, [...(m.get(s.step) ?? []), s]);
+    return m;
+  }, [d]);
+  const names = [...new Set([...(d?.steps.map((s) => s.name) ?? []), ...stats.steps.map((s) => s.name), ...byStep.keys()])].filter((n) => byStep.has(n));
+  const cap = d?.capture;
+  const statOf = (name: string) => stats.steps.find((s) => s.name === name);
+  const defOf = (name: string) => d?.steps.find((s) => s.name === name)?.request;
+  const hint = cap
+    ? `The numbers above count every request. For each step the run keeps the first ${cap.okSamples} successful and ${cap.errorSamples} failed calls in full: what was sent, what came back and what was saved. ${cap.maskSecrets ? 'Credentials are masked.' : 'Credentials are shown.'}`
+    : 'Full request and response of the calls kept for each step.';
+  const off = cap && cap.okSamples + cap.errorSamples === 0;
+  const running = status === 'starting' || status === 'running';
+
+  return (
+    <Card
+      title="Call details"
+      hint={hint}
+      actions={
+        <button className="btn small" onClick={() => void calls.reload()} disabled={calls.loading}>
+          Refresh
+        </button>
+      }
+    >
+      {calls.error ? (
+        <div className="callout bad">{calls.error.message}</div>
+      ) : !d ? (
+        <Loading what="Loading call details" />
+      ) : names.length === 0 ? (
+        <div className="faint">
+          {off
+            ? 'Call capture was switched off for this run (Load & criteria → Call details).'
+            : running
+              ? 'No calls kept yet. They appear here as the run makes requests.'
+              : 'No call details were kept for this run. Runs started before this feature existed have none.'}
+        </div>
+      ) : (
+        <div className="stack" style={{ gap: 10 }}>
+          {names.map((name) => {
+            const list = byStep.get(name)!;
+            const st = statOf(name);
+            const def = defOf(name);
+            const failed = list.filter((c) => c.outcome === 'error').length;
+            const defText = def
+              ? [`${def.method} ${def.url}`, ...Object.entries(def.headers ?? {}).map(([k, v]) => `${k}: ${v}`), ...(def.body !== undefined ? ['', def.body] : [])].join('\n')
+              : '';
+            return (
+              <details key={name} className="call-step" open={failed > 0}>
+                <summary>
+                  <MethodTag method={def?.method ?? list[0].request.method} />
+                  <span className="mono call-step-name" title={name}>
+                    {name}
+                  </span>
+                  {st && (
+                    <span className="faint">
+                      {fmt.num(st.count)} calls · {fmt.num(st.errors)} failed · avg {fmt.ms(st.avgMs)}
+                    </span>
+                  )}
+                  <span className="chip">{list.length - failed} ok kept</span>
+                  {failed > 0 && <span className="badge bad">{failed} failed kept</span>}
+                </summary>
+                <div className="stack" style={{ gap: 8, padding: '10px 12px' }}>
+                  {def && (
+                    <details className="call-def">
+                      <summary>Configured request (variables not yet filled in)</summary>
+                      <pre className="call-pre">{defText}</pre>
+                    </details>
+                  )}
+                  <CallList calls={[...list].sort((a, b) => Number(b.outcome === 'error') - Number(a.outcome === 'error') || a.at - b.at)} />
+                </div>
+              </details>
+            );
+          })}
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -272,6 +357,7 @@ export function RunPage() {
                 <div className="card-body faint">No errors 🎉</div>
               )}
             </Card>
+            <CallDetails runId={id} status={r.status} stats={stats} />
           </>
         ) : (
           <Card>

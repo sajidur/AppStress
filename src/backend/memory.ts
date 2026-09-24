@@ -1,7 +1,8 @@
 import type { SharedCache } from '../engine/executor.js';
+import { mergeSamples } from '../engine/sampling.js';
 import type { Snapshot } from '../metrics/collector.js';
 import { computeStats, mergeSnapshot, type RawRun, type RunStats } from '../metrics/stats.js';
-import type { RunConfig, VuJob, Workflow } from '../types.js';
+import { DEFAULT_CAPTURE, type CallSample, type RunConfig, type VuJob, type Workflow } from '../types.js';
 import { STALE_MS, type Backend, type JobDelivery, type JobQueue, type StateBackend, type WorkerInfo } from './types.js';
 
 interface MemoryRun {
@@ -15,6 +16,7 @@ interface MemoryRun {
   done: number;
   active: Map<string, { n: number; ts: number }>;
   raw: RawRun;
+  samples: CallSample[];
   cache: Map<string, { vars: Record<string, string>; expiresAt: number }>;
   createdAt: number;
   expiry?: NodeJS.Timeout;
@@ -50,6 +52,7 @@ export class MemoryState implements StateBackend {
       done: 0,
       active: new Map(),
       raw: { config, vus: { started: 0, active: 0, done: 0 }, steps: new Map(), timeline: new Map(), errors: new Map() },
+      samples: [],
       cache: new Map(),
       createdAt: Date.now(),
     });
@@ -104,7 +107,13 @@ export class MemoryState implements StateBackend {
 
   async flushMetrics(runId: string, snap: Snapshot) {
     const r = this.run(runId);
-    if (r) mergeSnapshot(r.raw, snap);
+    if (!r) return;
+    mergeSnapshot(r.raw, snap);
+    if (snap.samples.length) mergeSamples(r.samples, snap.samples, r.config.capture ?? DEFAULT_CAPTURE);
+  }
+
+  async loadSamples(runId: string) {
+    return [...(this.run(runId)?.samples ?? [])];
   }
 
   async loadStats(runId: string, stepOrder: string[] = []): Promise<RunStats> {

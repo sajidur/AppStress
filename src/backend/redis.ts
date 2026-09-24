@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import type { SharedCache } from '../engine/executor.js';
 import type { Snapshot } from '../metrics/collector.js';
 import { computeStats, emptyRawStep, type RawRun, type RunStats } from '../metrics/stats.js';
-import type { RunConfig, Workflow } from '../types.js';
+import { DEFAULT_CAPTURE, type CallSample, type RunConfig, type Workflow } from '../types.js';
 import { STALE_MS, type StateBackend, type WorkerInfo } from './types.js';
 
 /** All Redis keys used by one run live under lt:<runId>:* */
@@ -24,6 +24,9 @@ export const keys = {
   hist: (r: string, s: string) => `lt:${r}:hist:${s}`,
   timeline: (r: string) => `lt:${r}:timeline`,
   errors: (r: string) => `lt:${r}:errors`,
+  /** list of JSON call samples; sampleCounts: hash "step|outcome" -> how many were kept */
+  samples: (r: string) => `lt:${r}:samples`,
+  sampleCounts: (r: string) => `lt:${r}:samples:count`,
   cache: (r: string, k: string) => `lt:${r}:cache:${k}`,
   iterations: (r: string) => `lt:${r}:iterations`,
 };
@@ -35,6 +38,7 @@ type LtRedis = Redis & {
 type LtPipeline = ReturnType<Redis['pipeline']> & {
   hsetmax(k: string, f: string, v: number): unknown;
   hsetmin(k: string, f: string, v: number): unknown;
+  pushsample(list: string, counts: string, field: string, cap: number, json: string): unknown;
 };
 
 function createRedis(url: string): LtRedis {
@@ -48,6 +52,12 @@ function createRedis(url: string): LtRedis {
     numberOfKeys: 1,
     lua: `local c = redis.call('HGET', KEYS[1], ARGV[1])
           if (not c) or tonumber(ARGV[2]) < tonumber(c) then redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]) end return 1`,
+  });
+  // keep a call sample only while fewer than `cap` were stored for this step/outcome (atomic across workers)
+  redis.defineCommand('pushsample', {
+    numberOfKeys: 2,
+    lua: `local n = tonumber(redis.call('HGET', KEYS[2], ARGV[1]) or '0')
+          if n < tonumber(ARGV[2]) then redis.call('HSET', KEYS[2], ARGV[1], n + 1) redis.call('RPUSH', KEYS[1], ARGV[3]) return 1 end return 0`,
   });
   redis.on('error', (e) => console.error('[redis]', e.message));
   return redis;
@@ -146,7 +156,27 @@ export class RedisState implements StateBackend {
       p.hincrbyfloat(tk, `${sec}:s`, s.sumMs);
     }
     for (const [key, c] of snap.errors) p.hincrby(keys.errors(runId), key, c);
+    if (snap.samples.length) {
+      const cap = await this.captureOf(runId);
+      for (const s of snap.samples) {
+        p.pushsample(keys.samples(runId), keys.sampleCounts(runId), `${s.step}|${s.outcome}`, s.outcome === 'ok' ? cap.okSamples : cap.errorSamples, JSON.stringify(s));
+      }
+    }
     await p.exec();
+  }
+
+  private captures = new Map<string, Promise<typeof DEFAULT_CAPTURE>>();
+  private captureOf(runId: string) {
+    let c = this.captures.get(runId);
+    if (!c) {
+      c = this.redis.get(keys.config(runId)).then((raw) => (raw ? (JSON.parse(raw) as RunConfig).capture : undefined) ?? DEFAULT_CAPTURE);
+      this.captures.set(runId, c);
+    }
+    return c;
+  }
+
+  async loadSamples(runId: string): Promise<CallSample[]> {
+    return (await this.redis.lrange(keys.samples(runId), 0, -1)).map((j) => JSON.parse(j) as CallSample);
   }
 
   async loadStats(runId: string, stepOrder: string[] = []): Promise<RunStats> {

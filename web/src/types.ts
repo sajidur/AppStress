@@ -1,5 +1,10 @@
 // Types shared with the server (type-only imports, erased at build time).
 export type {
+  AuthConfig,
+  CallSample,
+  CaptureSettings,
+  StepRequest,
+  ResponseSample,
   Extractor,
   Step,
   Workflow,

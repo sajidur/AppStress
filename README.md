@@ -39,7 +39,7 @@ Requirements: **Node.js ≥ 22.13**.
 
 ```bash
 npm install
-npx playwright install chromium          # the browser used for recording
+# Recording uses the installed Google Chrome, so no browser download is needed.
 npm run build
 npm start                                # → http://localhost:4100  (in-memory mode)
 ```
@@ -60,7 +60,7 @@ LT_MODE=distributed npx lt worker -c 300 # on as many machines as you need
 Open **http://localhost:4100** → **New test** → enter a name and your application's URL.
 
 ### 1. Record
-Click **Start recording**. A Chromium window opens on the machine running Load Test Studio. Perform the journey the way a real user would: log in, search, add to cart, submit a form. Then close the window or click **Stop & save**. Captured requests stream into the page live.
+Click **Start recording**. A Google Chrome window opens on the machine running Load Test Studio. Perform the journey the way a real user would: log in, search, add to cart, submit a form. Then close the window or click **Stop & save**. Captured requests stream into the page live.
 
 - Only your application's traffic is kept: requests to your site's domain *and its subdomains* (e.g. `www.` and `api.`). Static assets (JS, CSS, images, fonts), analytics and RUM beacons, error reporters and chat widgets are filtered out.
 - **No display on the server?** In your own browser, open DevTools → Network → *Save all as HAR*, then use **Import HAR / recording file**.
@@ -84,8 +84,15 @@ Click **Build workflow**. The builder:
 - **separates setup from iteration**: the login runs once per virtual user, and the business transaction repeats.
 - **keeps think time** from your pauses between actions.
 - assigns a variable to each host (`${baseUrl}`, `${apiUrl}`, …) so the test can be pointed at another environment.
+- **keeps only the request types you choose.** Under *Request types that count as test steps*, tick Pages (document), API calls (XHR / fetch), JavaScript, CSS, Images, Fonts, Media or Other. The default is pages and API calls. Ticking JavaScript turns recorded script files into steps. On the CLI: `lt build --types document,xhr,script`.
 
 Then review it in the step editor. For each step you can edit the URL, headers and body, and add **assertions** (expected status codes, text the response body must contain). You can add **extractors** (JSON path, header, cookie or regex), reorder or delete steps, and move steps between setup and iteration. **Edit JSON** gives full control.
+
+#### Use data from another step
+Every value field in a step has a **`{ }`** button. It lists what is available at that point: values saved by earlier steps, users-file columns (`user.<column>`), workflow variables and generators (`$uuid`, `$timestamp`, `$randomInt(1,100)`, `$iteration`). *From an earlier step's response…* opens the recorded response of any earlier step. Click a JSON field, header, cookie or hidden page field and it becomes a saved variable and is inserted for you. This works for the URL, **query parameters**, **JSON and form body fields**, headers and authentication. Picking a value in a table row binds the whole field, and a bare number stays a number (`{"itemId":${itemId}}`). Steps that use a value nobody produces are flagged with a warning.
+
+#### Authentication
+The **Authentication** panel adds credentials to every request: a bearer token, basic auth, or an API key in a header or the URL. Values are templates such as `${accessToken}` from the login response. A request goes out without them until that value exists, so the login itself needs no exception. A step that sets its own `Authorization` header is left alone, and *Do not add the workflow authentication* excludes a step. If the recorded steps all repeat the same `Authorization` header, one click moves it into the panel. Validate marks each request with whether authentication was sent.
 
 **Validate** runs the workflow once as one user and shows every request, its status, timing and the values extracted from it. Fix any red step here before loading the system.
 
@@ -100,6 +107,19 @@ Then review it in the step editor. For each step you can edit the URL, headers a
 **Start load test** opens the live dashboard: active VUs, throughput, error rate, p95, the criteria evaluated live, charts over time, per-step response times and grouped errors. You can **Stop** at any time and keep the results collected so far.
 
 When the run finishes it gets a **PASSED / FAILED** verdict and becomes a permanent report with **HTML**, **JUnit XML** and **JSON** downloads. **Run history** lists every run across all tests.
+
+#### Call details: check every request and response
+Counting millions of requests is cheap, but keeping every request and response is not. So each run keeps the **full details of a few calls per step**: the first 3 successful and the first 5 failed ones by default. Change this under *Load & criteria → Call details in reports*, or on the command line with `--samples`, `--error-samples` and `--body-kb`.
+
+For each kept call the run page, the HTML report and the JSON report show:
+- the request: method, final URL, **headers** (including the cookies the session sent and the authentication), and **body**
+- the response: status, **headers**, **body** (JSON is pretty printed), size, and any redirects that were followed
+- the values that call saved for later steps, the timing, the virtual user and the iteration
+- the configured request, with `${variables}` not yet filled in, so you can compare it with what was actually sent
+
+A call that failed before it was sent (for example a `${variable}` no earlier step provides) is kept too, with the unfilled request and the error. **Validate** shows the same details for every call it makes, and each call can be copied as a cURL command.
+
+**Credentials are masked by default**: Authorization and Cookie headers, and password, secret and token fields in bodies and URLs. A short prefix stays visible so values can still be matched by eye. Untick *Mask credentials* to see real values, and share such reports with care. On the command line use `--no-mask`.
 
 ---
 
