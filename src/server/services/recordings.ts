@@ -6,6 +6,23 @@ import type { Store } from '../db.js';
 import type { EventHub } from '../events.js';
 import { HttpError } from './helpers.js';
 
+/** What to do about a failed recording, from the browser's own error message. Empty when nothing specific applies. */
+export function recordingHint(message: string, browser = 'chrome'): string {
+  const name = browser === 'msedge' ? 'Microsoft Edge' : browser === 'chromium' ? "Playwright's Chromium" : 'Google Chrome';
+  if (/Timeout \d+ms exceeded/i.test(message) && /launch/i.test(message)) {
+    return ` — ${name} did not start in time. Close other ${name} windows, check that antivirus is not blocking it, and try again.`;
+  }
+  if (/distribution .* is not found|Executable doesn't exist|Unsupported chromium channel/i.test(message)) {
+    return browser === 'chromium'
+      ? ' — run "npx playwright install chromium" on the machine that runs the studio'
+      : ` — ${name} was not found on the machine that runs the studio (the browser opens there). Install it, or set LT_RECORDER_BROWSER=chromium and run "npx playwright install chromium".`;
+  }
+  if (/has been closed|Target closed|Browser closed/i.test(message)) return ' — the browser window was closed before recording could start.';
+  if (/EPERM|EACCES|ENOSPC/i.test(message)) return ' — the studio cannot write to the temporary folder it uses for the browser profile.';
+  if (/Missing X server|\$DISPLAY|headed browser/i.test(message)) return ' — this machine has no display. Set LT_RECORDER_HEADLESS=true, or record elsewhere and import the file.';
+  return '';
+}
+
 export const recordingTopic = (testId: string) => `recording:${testId}`;
 
 /** Manages live browser recording sessions (at most one per test). */
@@ -17,6 +34,7 @@ export class RecordingService {
     private readonly hub: EventHub,
     private readonly log: FastifyBaseLogger,
     private readonly headless: boolean,
+    private readonly browser: string = 'chrome',
   ) {}
 
   isActive(testId: string): boolean {
@@ -32,7 +50,7 @@ export class RecordingService {
 
   start(testId: string, url: string, timeoutSec?: number): void {
     if (this.sessions.has(testId)) throw new HttpError(409, 'A recording is already in progress for this test');
-    const session = RecordingSession.start({ url, headless: this.headless, timeoutSec });
+    const session = RecordingSession.start({ url, headless: this.headless, browser: this.browser, timeoutSec });
     this.sessions.set(testId, session);
     const topic = recordingTopic(testId);
     this.hub.publish(topic, { type: 'started' });
@@ -47,10 +65,7 @@ export class RecordingService {
       })
       .catch((e) => {
         this.log.error({ testId, err: errorMessage(e) }, 'recording failed');
-        const hint = /Executable doesn't exist|browserType.launch|distribution .chrome. is not found/i.test(errorMessage(e))
-          ? ' — install Google Chrome on the server (https://www.google.com/chrome) and try again'
-          : '';
-        this.hub.publish(topic, { type: 'failed', error: errorMessage(e) + hint });
+        this.hub.publish(topic, { type: 'failed', error: errorMessage(e) + recordingHint(errorMessage(e), this.browser) });
       })
       .finally(() => this.sessions.delete(testId));
   }

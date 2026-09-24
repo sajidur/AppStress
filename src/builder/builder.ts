@@ -1,6 +1,8 @@
 import { formatPath, walkLeaves, type PathToken } from '../engine/jsonpath.js';
 import type { Extractor, RecordedExchange, Recording, Step, Workflow } from '../types.js';
 import { escapeRegex } from '../util.js';
+import { encodedForms, encodedHits, plainHits, replaceEncodedForms } from './encodings.js';
+import { analyzeFlow, type FlowReport } from './flow.js';
 
 export interface BuildOptions {
   name?: string;
@@ -32,6 +34,42 @@ export interface BuildReport {
   dropped: number;
   correlations: { variable: string; source: string; extractor: string; usedIn: string[] }[];
   userFieldSteps: string[];
+  /** values the browser made up itself (request ids, timestamps): they are generated fresh for every call and user */
+  generated?: GeneratedValue[];
+  /** steps moved to the teardown because they log the user out at the end of the recording */
+  teardown?: string[];
+  /** users-file values the page sends encoded (Base64, hex, a hash): each user's own value is encoded the same way */
+  encoded?: { step: string; field: string; filters: string }[];
+  /** where each value flows: which step feeds which, and what is fixed, unused or unexplained */
+  flow?: FlowReport;
+  /** what was typed into the page while recording, and which requests carried it */
+  typed?: TypedTrace[];
+}
+
+/** A value typed into a form field while recording, followed to the requests that sent it. */
+export interface TypedTrace {
+  field: string;
+  label?: string;
+  type: string;
+  /** the typed text (hidden for password fields) */
+  value: string;
+  /** the users-file column it now comes from */
+  column?: string;
+  /** steps whose recorded request contained this value (as typed, or encoded) */
+  sentIn: string[];
+  /** how the page encoded it before sending, when it did not send it as typed (e.g. base64, sha256) */
+  encoding?: string[];
+}
+
+export interface GeneratedValue {
+  kind: 'uuid' | 'timestamp' | 'timestamp-seconds' | 'iso-date';
+  step: string;
+  /** where it was sent, e.g. header "x-request-id" or body field "clientId" */
+  where: string;
+  /** the value seen in the recording */
+  recorded: string;
+  /** variable holding it when the same value is used by later steps */
+  variable?: string;
 }
 
 const DROP_HEADERS = new Set([
@@ -77,6 +115,20 @@ export function siteDomain(hostname: string): string {
   if (/^[\d.]+$/.test(hostname) || !hostname.includes('.')) return hostname; // IP / localhost
   return hostname.split('.').slice(MULTI_PART_TLD.test(hostname) ? -3 : -2).join('.');
 }
+
+const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const EPOCH_MS_RE = /(?<![\d.])\d{13}(?![\d])/g;
+const EPOCH_S_RE = /(?<![\d.])\d{10}(?![\d.])/g;
+const ISO_RE = /\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z\b/g;
+/** names of headers / fields that carry an id the client makes up for every request */
+const CLIENT_ID_KEY = /(request|correlation|trace|idempotenc|nonce|txn|transaction|operation|client|external|reference|uuid|guid|uid|event|message|batch)[-_ ]?(id|key|token)?$/i;
+
+/** A request that ends the session: /Account/LogOff, /api/auth/logout, /signout.aspx ... */
+const LOGOUT = /(^|[/._-])(log[-_]?out|log[-_]?off|sign[-_]?out|sign[-_]?off)([/._?-]|$)/i;
+const pathOnly = (url: string) => url.replace(/^\$\{[^}]+\}/, '').split('?')[0];
+
+/** Apply fn to the parts of a text that are not ${placeholders}. */
+const literalParts = (text: string, fn: (part: string) => string) => text.split(/(\$\{[^}]*\})/).map((s, i) => (i % 2 ? s : fn(s))).join('');
 
 /** Variable name for a secondary origin: https://api.example.com -> apiUrl */
 function originVar(origin: string, used: Set<string>): string {
@@ -149,6 +201,14 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
   const varForCandidate = new Map<string, string>();
   const correlationByVar = new Map<string, BuildReport['correlations'][number]>();
   const stepNames = new Map<string, number>();
+  /** client-made ids already turned into a variable (so later requests reuse the same value) */
+  const uuidVars = new Map<string, string>();
+  /** did an earlier response already contain this value? then it comes from the server, not from the browser */
+  const seenInResponse = (needle: string, at: RecordedExchange) => {
+    const n = needle.toLowerCase();
+    return rec.exchanges.some((e) => e !== at && e.startedAt <= at.startedAt && ((e.response?.body?.toLowerCase().includes(n) ?? false) || Object.values(e.response?.headers ?? {}).some((h) => h.toLowerCase().includes(n))));
+  };
+  const stepOfExchange = new Map<number, string>();
   let rawRequestsSoFar = '';
   let lastUserStep = -1;
   let prevEnd = kept[0]?.startedAt ?? 0;
@@ -180,24 +240,6 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
     const isJson = /json/i.test(ex.request.headers['content-type'] ?? '') || looksLikeJson(body);
     const pendingName = provisionalName(ex, origin);
 
-    // --- user credentials / typed data -> ${user.field}
-    let usesUser = false;
-    for (const [field, value] of userEntries) {
-      const ph = `\${user.${field}}`;
-      const enc = encodeURIComponent(value);
-      const formEnc = new URLSearchParams({ v: value }).toString().slice(2);
-      const before = url + JSON.stringify(headers) + (body ?? '');
-      url = replaceAll(url, value, ph);
-      if (enc !== value) url = replaceAll(url, enc, `\${user.${field}|urlencode}`);
-      if (body !== undefined) {
-        if (isForm && formEnc !== value) body = replaceAll(body, formEnc, `\${user.${field}|urlencode}`);
-        body = replaceAll(body, value, isJson ? `\${user.${field}|json}` : ph);
-      }
-      for (const k of Object.keys(headers)) headers[k] = replaceAll(headers[k], value, ph);
-      if (before !== url + JSON.stringify(headers) + (body ?? '')) usesUser = true;
-    }
-    if (usesUser) lastUserStep = i;
-
     // --- correlation of dynamic values from earlier responses
     if (opts.correlate) {
       // long values: substring replacement anywhere (tokens, UUIDs, JWTs, CSRF)
@@ -220,11 +262,84 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
         }
         for (const k of Object.keys(headers)) headers[k] = replaceAll(headers[k], c.value, `\${${v}}`);
       }
+    }
+
+    // --- user credentials / typed data -> ${user.field}
+    // Only the text that is still literal: a value that was just linked to an earlier response (a token that happens to
+    // contain the user name, say) must stay linked to that response.
+    let usesUser = false;
+    // First the values the page sent encoded (Base64 of the user name, a hashed password): they must be recognised
+    // before the plain values, which could otherwise match by chance inside the encoded text.
+    const encodedNotes: { field: string; filters: string }[] = [];
+    for (const [field, value] of userEntries) {
+      const forms = encodedForms(value);
+      if (!forms.length) continue;
+      const used = new Set<string>();
+      url = literalParts(url, (p) => replaceEncodedForms(p, field, forms, used));
+      if (body !== undefined) body = literalParts(body, (p) => replaceEncodedForms(p, field, forms, used));
+      for (const k of Object.keys(headers)) headers[k] = literalParts(headers[k], (p) => replaceEncodedForms(p, field, forms, used));
+      for (const filters of used) encodedNotes.push({ field, filters });
+    }
+    if (encodedNotes.length) usesUser = true;
+    for (const [field, value] of userEntries) {
+      const ph = `\${user.${field}}`;
+      const enc = encodeURIComponent(value);
+      const formEnc = new URLSearchParams({ v: value }).toString().slice(2);
+      const before = url + JSON.stringify(headers) + (body ?? '');
+      url = literalParts(url, (p) => {
+        const out = replaceAll(p, value, ph);
+        return enc !== value ? replaceAll(out, enc, `\${user.${field}|urlencode}`) : out;
+      });
+      if (body !== undefined) {
+        body = literalParts(body, (p) => {
+          const out = isForm && formEnc !== value ? replaceAll(p, formEnc, `\${user.${field}|urlencode}`) : p;
+          return replaceAll(out, value, isJson ? `\${user.${field}|json}` : ph);
+        });
+      }
+      for (const k of Object.keys(headers)) headers[k] = literalParts(headers[k], (p) => replaceAll(p, value, ph));
+      if (before !== url + JSON.stringify(headers) + (body ?? '')) usesUser = true;
+    }
+    if (usesUser) lastUserStep = i;
+
+    if (opts.correlate) {
       // short values (numeric ids etc.): only in structured positions with an id-like key
       url = correlateUrlIds(url, shortCandidates, (c) => varFor(c, pendingName));
       if (body !== undefined && isJson) body = correlateJsonIds(body, shortCandidates, (c) => varFor(c, pendingName));
       if (body !== undefined && isForm) body = correlateFormIds(body, shortCandidates, (c) => varFor(c, pendingName));
     }
+
+    // --- values the browser generated by itself: ids made up per request, and the current time
+    const set: Record<string, string> = {};
+    const generalize = (text: string, where: string, key?: string): string =>
+      literalParts(text, (part) => {
+        let out = part;
+        // a made-up id: sent by the client, never seen in any earlier response, in a header or field meant for such ids
+        out = out.replace(UUID_RE, (m, offset: number) => {
+          const k = key ?? /["']?([\w-]+)["']?\s*[:=]\s*["']?$/.exec(part.slice(0, offset))?.[1];
+          const known = uuidVars.get(m.toLowerCase());
+          if (known) return '${' + known + '}';
+          if (!k || !CLIENT_ID_KEY.test(k) || seenInResponse(m, ex)) return m;
+          const v = uniqueName(varNames, camel(k));
+          uuidVars.set(m.toLowerCase(), v);
+          set[v] = '${$uuid}';
+          (report.generated ??= []).push({ kind: 'uuid', step: pendingName, where: where.startsWith('header') ? where : `field "${k}"`, recorded: m, variable: v });
+          return '${' + v + '}';
+        });
+        if (ex.startedAt > 1e12) {
+          const near = (ms: number) => Math.abs(ms - ex.startedAt) <= 10 * 60 * 1000;
+          out = out.replace(EPOCH_MS_RE, (m) => (near(Number(m)) ? note('timestamp', m, where, '${$timestamp}') : m));
+          out = out.replace(EPOCH_S_RE, (m) => (near(Number(m) * 1000) ? note('timestamp-seconds', m, where, '${$timestampSec}') : m));
+          out = out.replace(ISO_RE, (m) => (near(Date.parse(m)) ? note('iso-date', m, where, '${$isoDate}') : m));
+        }
+        return out;
+      });
+    const note = (kind: GeneratedValue['kind'], recorded: string, where: string, replacement: string) => {
+      (report.generated ??= []).push({ kind, step: pendingName, where, recorded });
+      return replacement;
+    };
+    url = generalize(url, 'URL');
+    for (const k of Object.keys(headers)) headers[k] = generalize(headers[k], `header "${k}"`, k);
+    if (body !== undefined) body = generalize(body, 'body');
 
     // --- think time from the pause before this request
     const gap = ex.startedAt - prevEnd;
@@ -242,6 +357,7 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
         ...(Object.keys(headers).length ? { headers } : {}),
         ...(body !== undefined ? { body } : {}),
       },
+      ...(Object.keys(set).length ? { set } : {}),
       ...(thinkTimeMs ? { thinkTimeMs } : {}),
     };
     // fix up usage bookkeeping with the final name
@@ -249,8 +365,11 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
       const idx = corr.usedIn.indexOf(pendingName);
       if (idx >= 0) corr.usedIn[idx] = step.name;
     }
+    for (const g of report.generated ?? []) if (g.step === pendingName) g.step = step.name;
+    for (const n of encodedNotes) (report.encoded ??= []).push({ step: step.name, ...n });
     if (usesUser) report.userFieldSteps.push(step.name);
     steps.push(step);
+    stepOfExchange.set(ex.id, step.name);
 
     // --- harvest candidates from this response for later requests
     rawRequestsSoFar += rawReq;
@@ -263,6 +382,11 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
     const firstField = userEntries.at(-1)?.[0] ?? Object.keys(userFields)[0];
     if (vars.length) login.cache = { key: `auth:\${user.${firstField}}`, ttlSec: opts.cacheLoginTtlSec, vars };
   }
+
+  // A logout at the end of the recording ends the user's session: it belongs to the teardown, not to every iteration.
+  const teardown: Step[] = [];
+  while (steps.length > 1 && LOGOUT.test(pathOnly(steps[steps.length - 1].request.url))) teardown.unshift(steps.pop()!);
+  if (teardown.length) report.teardown = teardown.map((t) => t.name);
 
   let setup = lastUserStep >= 0 ? steps.slice(0, lastUserStep + 1) : [];
   let main = lastUserStep >= 0 ? steps.slice(lastUserStep + 1) : steps;
@@ -279,8 +403,37 @@ export function buildWorkflow(rec: Recording, opts: BuildOptions): { workflow: W
     },
     setup,
     steps: main,
+    ...(teardown.length ? { teardown } : {}),
     onError: 'abortIteration',
   };
+
+  // follow what the user typed while recording to the requests that carried it
+  report.flow = analyzeFlow(workflow);
+  report.typed = (rec.typedInputs ?? []).map((t) => {
+    const plain = plainHits(kept, t.value);
+    const encoded = encodedHits(kept, t.value);
+    // in the order the requests were made
+    const sentIn = [...new Set([...new Set([...plain, ...encoded.map((e) => e.k)])].sort((a, b) => a.id - b.id).map((k) => stepOfExchange.get(k.id)!))];
+    const encoding = [...new Set(encoded.map((e) => e.filters))];
+    const column = Object.entries(userFields).find(([, v]) => v === t.value)?.[0];
+    const shown = t.label || t.field;
+    if (!sentIn.length && t.value.length >= 3) {
+      report.flow!.issues.unshift({
+        level: 'warn',
+        kind: 'encrypted',
+        message: `You typed a value into "${shown}" but it is not in any recorded request, not even Base64, hex or hashed. The page probably encrypts it with a key or a salt.`,
+        hint: 'The test then cannot send the users-file value as it is. It needs the same transformation the page applies, or a server-side option that accepts plain values.',
+      });
+    } else if (!plain.length && encoded.length && t.value.length >= 3) {
+      report.flow!.issues.push({
+        level: 'info',
+        kind: 'encoded',
+        message: `"${shown}" is sent encoded (${encoding.join(', ')}). Each user's own value is encoded the same way.`,
+        hint: column ? `\${user.${column}|${encoding[0]}}` : 'Map the field to a users-file column so every user sends their own.',
+      });
+    }
+    return { field: t.field, label: t.label, type: t.type, value: t.type === 'password' ? '••••••' : t.value, column, sentIn, ...(encoding.length && !plain.length ? { encoding } : {}) };
+  });
   return { workflow, report };
 }
 

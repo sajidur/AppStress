@@ -21,12 +21,19 @@ import {
   placeholdersIn,
   setJsonField,
   splitUrl,
+  stepsOf,
   stripAuthorization,
   unresolvedVars,
   usedStepVars,
+  type Phase,
   type StepRef,
 } from '../../bindings';
 import { CallDetail } from '../../components/CallDetail';
+import { ListPickDialog } from '../../components/ListPickDialog';
+import { describePick, splitListPath } from '../../listpick';
+import { FILTERS } from '../../../../src/engine/filter-names';
+import { isMultiPath } from '../../../../src/engine/jsonpath';
+import { FlowPanel } from './FlowPanel';
 import { useAsync } from '../../hooks';
 import type { AuthConfig, BuildOptionsInput, Extractor, Step, ValidationResult, Workflow } from '../../types';
 import type { TabProps } from '../TestPage';
@@ -81,6 +88,14 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
   const [advanced, setAdvanced] = useState(false);
   const columns = test.dataset?.columns ?? [];
   const recorded = useAsync(() => api.getRecording(test.id), [test.id, test.recording?.createdAt]);
+  // what the user typed into the page while recording, and the users-file column each value most likely comes from
+  const typed = useAsync(() => api.typedInputs(test.id), [test.id, test.recording?.createdAt, test.dataset?.filename]);
+  const [typedMap, setTypedMap] = useState<Record<string, string>>(test.buildOptions?.typedMap ?? {});
+  useEffect(() => {
+    if (test.buildOptions?.typedMap || !typed.data) return;
+    const guess = Object.fromEntries(typed.data.typed.flatMap((t) => (t.suggestedColumn ? [[String(t.index), t.suggestedColumn]] : [])));
+    setTypedMap(guess);
+  }, [typed.data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selected = new Set(opts.resourceTypes ?? DEFAULT_TYPES);
   const counts = useMemo(() => {
@@ -119,9 +134,9 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
     }
     if ((test.workflow || dirty) && !confirm('Rebuilding replaces the current workflow, including your manual edits. Continue?')) return;
     const userFields = Object.fromEntries(fields.filter(([k, v]) => k.trim() && v !== ''));
-    const r = await run(() => api.buildWorkflow(test.id, { ...opts, includeDocuments: selected.has('document'), userFields }));
+    const r = await run(() => api.buildWorkflow(test.id, { ...opts, includeDocuments: selected.has('document'), userFields, typedMap: Object.keys(typedMap).length ? typedMap : undefined }));
     if (r) {
-      toast(`Workflow built: ${r.workflow.setup.length + r.workflow.steps.length} steps, ${r.report.correlations.length} dynamic values correlated`);
+      toast(`Workflow built: ${r.workflow.setup.length + r.workflow.steps.length + (r.workflow.teardown?.length ?? 0)} steps, ${r.report.correlations.length} dynamic values correlated`);
       await reload();
     }
   };
@@ -161,6 +176,68 @@ function BuildPanel({ test, reload, dirty }: TabProps & { dirty: boolean }) {
           </div>
           {selected.size === 0 && <div className="callout warn" style={{ marginTop: 8 }}>Select at least one request type.</div>}
         </div>
+
+        {typed.data && typed.data.typed.length > 0 && (
+          <div>
+            <div className="label">What you typed while recording</div>
+            <div className="help faint" style={{ fontSize: 12.5, margin: '4px 0 8px' }}>
+              Pick the users-file column each value comes from. Every virtual user then sends its own value there. Leave a field empty to keep the recorded value for everyone.
+            </div>
+            <div className="table-wrap">
+              <table className="t">
+                <thead>
+                  <tr>
+                    <th>Field</th>
+                    <th>Typed</th>
+                    <th>Take it from users-file column</th>
+                    <th>Sent as</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {typed.data.typed.map((t) => (
+                    <tr key={t.index}>
+                      <td>
+                        {t.label || t.field} {t.label && t.field && <span className="faint mono">({t.field})</span>}
+                      </td>
+                      <td className="mono">{t.value}</td>
+                      <td>
+                        {columns.length ? (
+                          <select
+                            aria-label={`Column for ${t.label || t.field}`}
+                            value={typedMap[String(t.index)] ?? ''}
+                            onChange={(e) => {
+                              const next = { ...typedMap };
+                              if (e.target.value) next[String(t.index)] = e.target.value;
+                              else delete next[String(t.index)];
+                              setTypedMap(next);
+                            }}
+                            style={{ maxWidth: 240 }}
+                          >
+                            <option value="">keep the recorded value</option>
+                            {columns.map((c) => (
+                              <option key={c}>{c}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="faint">Upload a users file first</span>
+                        )}
+                      </td>
+                      <td>
+                        {t.sentAs ? (
+                          <span className="badge info" title="The page never sends the typed text itself. Each user's own value is encoded the same way.">
+                            {t.sentAs.join(', ')}
+                          </span>
+                        ) : (
+                          <span className="faint">as typed</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
 
         <div>
           <div className="row between">
@@ -411,7 +488,7 @@ const textToHeaders = (t: string) => {
   return out;
 };
 
-function StepEditor({ step, ctx, hasAuth, onChange }: { step: Step; ctx: BindContext; hasAuth: boolean; onChange: (s: Step) => void }) {
+function StepEditor({ step, ctx, hasAuth, onChange, onPickItem }: { step: Step; ctx: BindContext; hasAuth: boolean; onChange: (s: Step) => void; onPickItem: (variable: string) => void }) {
   const [headersText, setHeadersText] = useState(headersToText(step.request.headers));
   const [rawBody, setRawBody] = useState(false);
   const [picking, setPicking] = useState<number | null>(null);
@@ -534,7 +611,8 @@ function StepEditor({ step, ctx, hasAuth, onChange }: { step: Step; ctx: BindCon
           Later steps can then use them as <code>{'${name}'}</code>: in the URL, parameters, body, headers or authentication.
         </div>
         {extractors.map((ex, i) => (
-          <div className="row" key={i} style={{ flexWrap: 'nowrap', marginBottom: 6 }}>
+          <div key={i} style={{ marginBottom: 6 }}>
+          <div className="row" style={{ flexWrap: 'nowrap' }}>
             <input type="text" className="mono" style={{ maxWidth: 150 }} placeholder="variable" aria-label="Variable name" value={ex.var} onChange={(e) => setEx(i, { var: e.target.value })} />
             <select style={{ maxWidth: 130 }} aria-label="Where to read it" value={ex.from} onChange={(e) => setEx(i, { from: e.target.value as Extractor['from'] })}>
               <option value="body">JSON path</option>
@@ -556,12 +634,46 @@ function StepEditor({ step, ctx, hasAuth, onChange }: { step: Step; ctx: BindCon
             <button className="btn small" title="Choose from the recorded response of this step" onClick={() => setPicking(i)} disabled={step.sourceId === undefined}>
               Pick…
             </button>
+            {ex.from === 'body' && ex.path && (splitListPath(ex.path) || isMultiPath(ex.path)) && (
+              <button className="btn small" title="Take the first, last or a random item, or the first one that matches a condition" onClick={() => onPickItem(ex.var)}>
+                Which item…
+              </button>
+            )}
             <label className="check" title="Do not fail the step when nothing matches">
               <input type="checkbox" checked={!!ex.optional} onChange={(e) => setEx(i, { optional: e.target.checked || undefined })} /> optional
             </label>
             <button className="btn icon ghost" aria-label="Remove extractor" onClick={() => set({ extract: extractors.filter((_, j) => j !== i) })}>
               ✕
             </button>
+          </div>
+          <div className="faint row" style={{ fontSize: 12, marginLeft: 4, gap: 8 }}>
+            {ex.from === 'body' && ex.path && ex.path !== '$.' && (
+              <span>
+                takes the {describePick(ex)}
+                {ex.default !== undefined ? ` · if none: "${ex.default}"` : ''}
+              </span>
+            )}
+            <label className="row" style={{ gap: 6 }} title="The value comes back encoded (Base64, hex, ...)? Decode it before later steps use it.">
+              <span>then</span>
+              <select aria-label="Transform the value" value={ex.transform ?? ''} onChange={(e) => setEx(i, { transform: e.target.value || undefined })} style={{ width: 210, height: 26, padding: '0 6px', fontSize: 12 }}>
+                <option value="">use it as it is</option>
+                {(ex.transform && !FILTERS.some((f) => f.name === ex.transform) ? [{ name: ex.transform, label: ex.transform, kind: 'other' as const, help: '' }] : []).map((f) => (
+                  <option key={f.name} value={f.name}>
+                    {f.label}
+                  </option>
+                ))}
+                {(['decode', 'encode', 'hash', 'other'] as const).map((kind) => (
+                  <optgroup key={kind} label={{ decode: 'Decode', encode: 'Encode', hash: 'Hash', other: 'Other' }[kind]}>
+                    {FILTERS.filter((f) => f.kind === kind && f.name !== 'json').map((f) => (
+                      <option key={f.name} value={f.name}>
+                        {f.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+            </label>
+          </div>
           </div>
         ))}
         <button className="btn small ghost" onClick={() => set({ extract: [...extractors, { var: '', from: 'body', path: '$.' }] })}>
@@ -597,17 +709,24 @@ function StepList({
   ctxFor,
   onChange,
   onEdit,
-  onMovePhase,
+  onPickItem,
+  moves,
+  onAdd,
+  addLabel,
 }: {
   title: string;
   hint: string;
   steps: Step[];
-  phase: 'setup' | 'steps';
+  phase: Phase;
   wf: Workflow;
   ctxFor: (ref: StepRef) => BindContext;
   onChange: (steps: Step[]) => void;
   onEdit: (index: number, step: Step) => void;
-  onMovePhase: (index: number) => void;
+  onPickItem: (step: string, variable: string) => void;
+  /** buttons that move a step to another list */
+  moves: { label: string; title: string; onMove: (index: number) => void }[];
+  onAdd?: () => void;
+  addLabel?: string;
 }) {
   const [open, setOpen] = useState<number | null>(null);
   const move = (i: number, d: number) => {
@@ -630,6 +749,13 @@ function StepList({
         </div>
       </div>
       {steps.length === 0 && <div className="faint" style={{ padding: '8px 0' }}>No steps.</div>}
+      {onAdd && steps.length === 0 && (
+        <div>
+          <button className="btn small ghost" onClick={onAdd}>
+            {addLabel}
+          </button>
+        </div>
+      )}
       {steps.map((s, i) => {
         const ref: StepRef = { phase, index: i };
         const uses = usedStepVars(wf, s);
@@ -662,9 +788,11 @@ function StepList({
                 <button className="btn icon ghost" title="Move down" onClick={() => move(i, 1)} disabled={i === steps.length - 1}>
                   ↓
                 </button>
-                <button className="btn small ghost" title={phase === 'setup' ? 'Run every iteration instead' : 'Run once per virtual user instead'} onClick={() => onMovePhase(i)}>
-                  {phase === 'setup' ? '→ iteration' : '→ setup'}
-                </button>
+                {moves.map((m) => (
+                  <button key={m.label} className="btn small ghost" title={m.title} onClick={() => m.onMove(i)}>
+                    {m.label}
+                  </button>
+                ))}
                 <button
                   className="btn icon ghost danger"
                   title="Delete step"
@@ -677,7 +805,7 @@ function StepList({
                 </button>
               </div>
             </div>
-            {open === i && <StepEditor step={s} ctx={ctxFor(ref)} hasAuth={!!wf.auth} onChange={(ns) => onEdit(i, ns)} />}
+            {open === i && <StepEditor step={s} ctx={ctxFor(ref)} hasAuth={!!wf.auth} onChange={(ns) => onEdit(i, ns)} onPickItem={(v) => onPickItem(s.name, v)} />}
           </div>
         );
       })}
@@ -793,8 +921,16 @@ function ValidatePanel({ test, dirty }: TabProps & { dirty: boolean }) {
 
 const mapStep = (wf: Workflow, ref: StepRef, fn: (s: Step) => Step): Workflow => ({
   ...wf,
-  [ref.phase]: wf[ref.phase].map((s, i) => (i === ref.index ? fn(s) : s)),
+  [ref.phase]: stepsOf(wf, ref.phase).map((s, i) => (i === ref.index ? fn(s) : s)),
 });
+
+/** Move a step from one list to another (setup -> iteration goes first, everything else goes last). */
+const moveBetween = (wf: Workflow, from: Phase, index: number, to: Phase): Workflow => {
+  const item = stepsOf(wf, from)[index];
+  const rest = { ...wf, [from]: stepsOf(wf, from).filter((_, j) => j !== index) } as Workflow;
+  const dest = stepsOf(rest, to);
+  return { ...rest, [to]: from === 'setup' && to === 'steps' ? [item, ...dest] : [...dest, item] };
+};
 
 export function WorkflowTab(props: TabProps) {
   const { test, reload } = props;
@@ -815,6 +951,23 @@ export function WorkflowTab(props: TabProps) {
 
   // All draft updates are functional so a binding (which edits two steps at once) never overwrites itself.
   const editStep = (ref: StepRef, ns: Step) => setDraft((d) => (d ? mapStep(d, ref, () => ns) : d));
+  const [pick, setPick] = useState<{ step: string; variable: string } | null>(null);
+  const locate = (stepName: string, variable: string) => {
+    if (!draft) return null;
+    for (const phase of ['setup', 'steps', 'teardown'] as const) {
+      const index = stepsOf(draft, phase).findIndex((s) => s.name === stepName);
+      if (index >= 0) {
+        const step = stepsOf(draft, phase)[index];
+        const i = (step.extract ?? []).findIndex((e) => e.var === variable);
+        if (i >= 0) return { ref: { phase, index } as StepRef, step, i, extractor: step.extract![i] };
+      }
+    }
+    return null;
+  };
+  const removeExtractor = (stepName: string, variable: string) => {
+    const at = locate(stepName, variable);
+    if (at) editStep(at.ref, { ...at.step, extract: at.step.extract!.filter((_, j) => j !== at.i) });
+  };
   const addExtractor = (source: StepRef, ex: Extractor) =>
     setDraft((d) => (d ? mapStep(d, source, (s) => ((s.extract ?? []).some((e) => e.var === ex.var) ? s : { ...s, extract: [...(s.extract ?? []), ex] })) : d));
   const ctxFor = (ref: StepRef): BindContext => ({ testId: test.id, workflow: draft!, ref, userColumns, extraVars, addExtractor });
@@ -852,11 +1005,14 @@ export function WorkflowTab(props: TabProps) {
   return (
     <div className="stack">
       <BuildPanel {...props} dirty={dirty} />
+      {draft && !jsonMode && (
+        <FlowPanel workflow={draft} userColumns={userColumns} report={test.buildReport} onPick={(step, variable) => setPick({ step, variable })} onRemove={removeExtractor} />
+      )}
       {draft && !jsonMode && <AuthPanel draft={draft} setDraft={setDraft} ctx={ctxFor({ phase: 'steps', index: draft.steps.length })} />}
       {draft && (
         <Card
           title="Steps"
-          hint={`${draft.setup.length + draft.steps.length} requests · variables: ${Object.keys(draft.variables).join(', ') || 'none'}`}
+          hint={`${draft.setup.length + draft.steps.length + (draft.teardown?.length ?? 0)} requests · variables: ${Object.keys(draft.variables).join(', ') || 'none'}`}
           actions={
             <>
               <button className="btn small ghost" onClick={toggleJson}>
@@ -894,7 +1050,8 @@ export function WorkflowTab(props: TabProps) {
                 ctxFor={ctxFor}
                 onChange={(setup) => setDraft({ ...draft, setup })}
                 onEdit={(i, s) => editStep({ phase: 'setup', index: i }, s)}
-                onMovePhase={(i) => setDraft({ ...draft, setup: draft.setup.filter((_, j) => j !== i), steps: [draft.setup[i], ...draft.steps] })}
+                onPickItem={(step, variable) => setPick({ step, variable })}
+                moves={[{ label: '→ iteration', title: 'Run every iteration instead', onMove: (i) => setDraft(moveBetween(draft, 'setup', i, 'steps')) }]}
               />
               <StepList
                 title="Iteration — repeats for the whole test"
@@ -905,7 +1062,25 @@ export function WorkflowTab(props: TabProps) {
                 ctxFor={ctxFor}
                 onChange={(steps) => setDraft({ ...draft, steps })}
                 onEdit={(i, s) => editStep({ phase: 'steps', index: i }, s)}
-                onMovePhase={(i) => setDraft({ ...draft, steps: draft.steps.filter((_, j) => j !== i), setup: [...draft.setup, draft.steps[i]] })}
+                onPickItem={(step, variable) => setPick({ step, variable })}
+                moves={[
+                  { label: '→ setup', title: 'Run once per virtual user instead', onMove: (i) => setDraft(moveBetween(draft, 'steps', i, 'setup')) },
+                  { label: '→ logout', title: 'Run when the user\'s session ends (teardown) instead', onMove: (i) => setDraft(moveBetween(draft, 'steps', i, 'teardown')) },
+                ]}
+              />
+              <StepList
+                title="Teardown — logout, when the user's session ends"
+                hint="Runs after a user's last iteration, and before the next login when every iteration starts a new session (Load & criteria). Skipped when you stop the run. Without it, every user stays signed in on the server."
+                steps={draft.teardown ?? []}
+                phase="teardown"
+                wf={draft}
+                ctxFor={ctxFor}
+                onChange={(teardown) => setDraft({ ...draft, teardown })}
+                onEdit={(i, s) => editStep({ phase: 'teardown', index: i }, s)}
+                onPickItem={(step, variable) => setPick({ step, variable })}
+                moves={[{ label: '→ iteration', title: 'Run every iteration instead', onMove: (i) => setDraft(moveBetween(draft, 'teardown', i, 'steps')) }]}
+                addLabel="+ Add logout step"
+                onAdd={() => setDraft({ ...draft, teardown: [{ name: 'POST /logout', request: { method: 'POST', url: '${baseUrl}/logout' } }] })}
               />
               <div>
                 <button
@@ -923,6 +1098,19 @@ export function WorkflowTab(props: TabProps) {
             </div>
           )}
         </Card>
+      )}
+      {pick && locate(pick.step, pick.variable) && (
+        <ListPickDialog
+          testId={test.id}
+          step={locate(pick.step, pick.variable)!.step}
+          extractor={locate(pick.step, pick.variable)!.extractor}
+          onClose={() => setPick(null)}
+          onApply={(patch) => {
+            const at = locate(pick.step, pick.variable)!;
+            editStep(at.ref, { ...at.step, extract: at.step.extract!.map((e, j) => (j === at.i ? { ...e, ...patch } : e)) });
+            setPick(null);
+          }}
+        />
       )}
       {test.workflow && <ValidatePanel {...props} dirty={dirty} />}
       {test.workflow && !dirty && (

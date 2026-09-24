@@ -9,6 +9,27 @@ import { ACTIVE_STATUSES, type RunRow, type RunStatus, type RunSummary, type Sto
 import type { EventHub } from '../events.js';
 import { applySettings, HttpError } from './helpers.js';
 
+/** How many calls there are per step and outcome. */
+export function groupCounts(calls: CallSample[]): { step: string; outcome: 'ok' | 'error'; count: number }[] {
+  const groups = new Map<string, { step: string; outcome: 'ok' | 'error'; count: number }>();
+  for (const c of calls) {
+    const g = groups.get(`${c.step}|${c.outcome}`) ?? { step: c.step, outcome: c.outcome, count: 0 };
+    g.count++;
+    groups.set(`${c.step}|${c.outcome}`, g);
+  }
+  return [...groups.values()];
+}
+
+/** At most n calls per step and outcome, in order. */
+export function limitPerGroup(calls: CallSample[], n: number): CallSample[] {
+  const seen = new Map<string, number>();
+  return calls.filter((c) => {
+    const k = `${c.step}|${c.outcome}`;
+    seen.set(k, (seen.get(k) ?? 0) + 1);
+    return seen.get(k)! <= n;
+  });
+}
+
 export const runTopic = (runId: string) => `run:${runId}`;
 
 function summarize(s: RunStats, iterations: number): RunSummary {
@@ -42,11 +63,14 @@ export class RunService {
   ) {}
 
   /** Call details of a run: live from the state store while it runs, from the database once it finished. */
-  async samples(runId: string): Promise<CallSample[]> {
+  async samples(runId: string, perGroup?: number): Promise<CallSample[]> {
     const run = this.store.getRun(runId);
     if (!run) throw new HttpError(404, 'Run not found');
-    if (ACTIVE_STATUSES.includes(run.status)) return this.backend.state.loadSamples(runId).catch(() => []);
-    return this.store.getRunSamples(runId);
+    if (ACTIVE_STATUSES.includes(run.status)) {
+      const live = await this.backend.state.loadSamples(runId).catch(() => [] as CallSample[]);
+      return perGroup === undefined ? live : limitPerGroup(live, perGroup);
+    }
+    return this.store.getRunSamples(runId, perGroup);
   }
 
   latestProgress(runId: string): RunProgress | undefined {
@@ -75,7 +99,8 @@ export class RunService {
         usersMode: settings.usersMode,
         thinkTimeScale: settings.thinkTimeScale,
         requestTimeoutMs: settings.requestTimeoutMs,
-        capture: settings.capture ?? DEFAULT_CAPTURE,
+        freshSession: settings.freshSession,
+        capture: settings.capture,
       });
       this.store.updateRun(runId, { status: 'running', config: cfg, startedAt: cfg.startAt });
       this.log.info({ runId, testId, vus: settings.vus }, 'run launched');
@@ -119,7 +144,7 @@ export class RunService {
   private monitor(runId: string, workflow: Workflow): void {
     if (this.monitoring.has(runId)) return;
     this.monitoring.add(runId);
-    const stepOrder = [...workflow.setup, ...workflow.steps].map((s) => s.name);
+    const stepOrder = [...workflow.setup, ...workflow.steps, ...(workflow.teardown ?? [])].map((s) => s.name);
     const topic = runTopic(runId);
 
     (async () => {
@@ -135,13 +160,13 @@ export class RunService {
       const samples: CallSample[] = await this.backend.state.loadSamples(runId).catch(() => []);
       const run = this.store.getRun(runId)!;
       const iterations = await this.backend.state.getIterations(runId);
+      this.store.saveRunCalls(runId, samples);
       const { verdict, results } = evaluateThresholds(stats, run.settings.thresholds ?? []);
       const status: RunStatus = outcome === 'completed' ? 'completed' : outcome;
       this.store.updateRun(runId, {
         status,
         verdict: outcome === 'timeout' ? 'error' : verdict,
         stats,
-        samples,
         summary: summarize(stats, iterations),
         thresholds: results,
         finishedAt: Date.now(),

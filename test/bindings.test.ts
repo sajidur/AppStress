@@ -157,3 +157,32 @@ describe('authentication detection', () => {
     assert.deepEqual(detectAuth(w)!.auth, { type: 'basic', username: 'al', password: 'pw:1' });
   });
 });
+
+describe('variables a step generates for itself', () => {
+  it('are available to its own request and to later steps, and are not reported as missing', () => {
+    const w = wf();
+    w.steps[0].set = { requestId: '${$uuid}' };
+    w.steps[0].request.headers = { 'x-request-id': '${requestId}' };
+    w.steps[1].request.headers = { 'x-request-id': '${requestId}' };
+    const names = (i: number) => availableVars(w, { phase: 'steps', index: i }).map((v) => v.name);
+    assert.ok(names(0).includes('requestId'), 'own request');
+    assert.ok(names(1).includes('requestId'), 'later step');
+    assert.deepEqual(unresolvedVars(w, { phase: 'steps', index: 0 }), []);
+    assert.deepEqual(unresolvedVars(w, { phase: 'steps', index: 1 }), []);
+  });
+});
+
+import { chainFor } from '../web/src/bindings.js';
+
+describe('choosing how a value is sent', () => {
+  it('adds what the place needs after the chosen encoding, unless the encoding is already safe there', () => {
+    assert.equal(chainFor(undefined, 'urlencode'), 'urlencode');
+    assert.equal(chainFor(undefined), undefined);
+    assert.equal(chainFor('base64'), 'base64');
+    assert.equal(chainFor('base64', 'urlencode'), 'base64|urlencode', 'Base64 contains + / = which a URL needs escaped');
+    assert.equal(chainFor('base64', 'json'), 'base64', 'Base64 is safe inside a JSON string');
+    assert.equal(chainFor('base64url', 'urlencode'), 'base64url');
+    assert.equal(chainFor('sha256', 'urlencode'), 'sha256');
+    assert.equal(chainFor('base64decode', 'json'), 'base64decode|json', 'decoded text can contain anything');
+  });
+});

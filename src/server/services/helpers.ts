@@ -3,7 +3,8 @@ import { keepEverything } from '../../engine/sampling.js';
 import { formatPath, walkLeaves } from '../../engine/jsonpath.js';
 import { MetricsCollector } from '../../metrics/collector.js';
 import { API_TYPES } from '../../recorder/recorder.js';
-import { DEFAULT_CAPTURE, type CaptureSettings, type RecordedExchange, type Recording, type ResponseSample, type TestSettings, type Workflow } from '../../types.js';
+import { DEFAULT_CAPTURE, type TypedInput, type CaptureSettings, type RecordedExchange, type Recording, type ResponseSample, type TestSettings, type Workflow } from '../../types.js';
+import { encodedHits, plainHits } from '../../builder/encodings.js';
 import { escapeRegex, parseCsv } from '../../util.js';
 
 export class HttpError extends Error {
@@ -104,6 +105,8 @@ export async function validateWorkflow(
       phase = `iteration ${i + 1}`;
       if (!(await vu.runIteration(i))) passed = false;
     }
+    phase = 'teardown';
+    if (wf.teardown?.length) await vu.runTeardown();
   }
   return { passed: passed && traces.every((t) => !t.error), traces };
 }
@@ -175,4 +178,59 @@ export function sampleExchange(ex: RecordedExchange): ResponseSample {
     sample.htmlFields = sample.htmlFields.slice(0, 100);
   }
   return sample;
+}
+
+/* ------------------------------------------------------------------ typed inputs */
+
+export interface TypedInputView {
+  /** position in the recording; used to map the field to a column without sending the value to the browser */
+  index: number;
+  field: string;
+  label?: string;
+  type: string;
+  /** the typed text; hidden for password fields */
+  value: string;
+  suggestedColumn?: string;
+  /** the value is never sent as typed, only encoded like this (e.g. base64, sha256) */
+  sentAs?: string[];
+}
+
+const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/** How well a users-file column name fits a form field's name / label (0 = not at all). */
+function nameScore(column: string, texts: (string | undefined)[]): number {
+  const c = norm(column);
+  if (c.length < 2) return 0;
+  let best = 0;
+  for (const t of texts) {
+    const n = norm(t ?? '');
+    if (n.length < 2) continue;
+    if (n === c) best = Math.max(best, 3);
+    else if (n.includes(c) || c.includes(n)) best = Math.max(best, 2);
+  }
+  return best;
+}
+
+/**
+ * What the user typed while recording, with the users-file column each value most likely comes from:
+ * the column whose values include the typed text (best), else the column whose name matches the field name/label.
+ */
+export function suggestTypedColumns(typed: TypedInput[], columns: string[], rows: Record<string, string>[], exchanges: RecordedExchange[] = []): TypedInputView[] {
+  return typed.map((t, index) => {
+    const sent = exchanges.filter((e) => e.response && !e.failure);
+    const encodings = plainHits(sent, t.value).length ? [] : [...new Set(encodedHits(sent, t.value).map((h) => h.filters))];
+    const byValue = columns.filter((c) => t.value.length >= 2 && rows.slice(0, 20_000).some((r) => r[c] === t.value));
+    const ranked = (byValue.length ? byValue : columns.filter((c) => nameScore(c, [t.field, t.label]) > 0)).sort(
+      (a, b) => nameScore(b, [t.field, t.label]) - nameScore(a, [t.field, t.label]),
+    );
+    return {
+      index,
+      field: t.field,
+      label: t.label,
+      type: t.type,
+      value: t.type === 'password' ? '••••••' : t.value,
+      suggestedColumn: ranked[0],
+      ...(encodings.length ? { sentAs: encodings } : {}),
+    };
+  });
 }

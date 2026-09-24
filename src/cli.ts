@@ -27,11 +27,12 @@ program
   .option('-o, --out <file>', 'recording output file', 'recordings/recording.json')
   .option('-u, --user-field <field=value>', 'value you will type that should come from the users list (repeatable)', collect, [])
   .option('--headless', 'run the browser headless (use with --script)', false)
+  .option('--browser <name>', 'chrome (installed Google Chrome), msedge, or chromium (Playwright bundled)', config.recorderBrowser)
   .option('--script <file>', 'automate the flow: module exporting default async (page, userFields) => {}')
   .option('--timeout <sec>', 'stop recording after N seconds', (v) => Number(v))
   .action(async (url: string, o) => {
     const { record } = await import('./recorder/recorder.js');
-    await record({ url, out: o.out, userFields: parseKeyValues(o.userField), headless: o.headless, script: o.script, timeoutSec: o.timeout });
+    await record({ url, out: o.out, userFields: parseKeyValues(o.userField), headless: o.headless, browser: o.browser, script: o.script, timeoutSec: o.timeout });
   });
 
 /* ------------------------------------------------------------------ build */
@@ -70,10 +71,13 @@ program
     mkdirSync(dirname(o.out), { recursive: true });
     writeFileSync(o.out, JSON.stringify(workflow, null, 2));
     log('build', `${report.kept} requests kept, ${report.dropped} dropped (static assets / other domains / noise)`);
-    log('build', `setup (once per VU): ${workflow.setup.length} steps, main (per iteration): ${workflow.steps.length} steps`);
+    log('build', `setup (once per VU): ${workflow.setup.length} steps, main (per iteration): ${workflow.steps.length} steps${workflow.teardown?.length ? `, teardown (logout): ${workflow.teardown.length} steps` : ''}`);
     if (report.userFieldSteps.length) log('build', `user data used in: ${report.userFieldSteps.join(', ')}`);
     else log('build', 'NOTE: no --user-field values were found in requests; every VU will send the recorded credentials.');
     for (const c of report.correlations) log('build', `correlated \${${c.variable}} <- [${c.source}] ${c.extractor}  used in: ${c.usedIn.join(', ')}`);
+    for (const g of report.generated ?? []) log('build', `made up by the browser: ${g.kind} in ${g.step} (${g.where}) -> generated fresh for every call`);
+    for (const t of report.typed ?? []) log('build', `typed into "${t.label || t.field}": ${t.column ? `from users-file column ${t.column}` : 'kept as recorded'}; sent in ${t.sentIn.length ? t.sentIn.join(', ') : 'no request as typed'}`);
+    for (const i of report.flow?.issues ?? []) if (i.level === 'warn') log('build', `WARNING: ${i.message}${i.hint ? ` (${i.hint})` : ''}`);
     log('build', `Workflow written to ${o.out} — review it, then run "lt validate ${o.out} --users <file>"`);
   });
 
@@ -125,6 +129,10 @@ program
         await vu.runIteration(i);
       }
     }
+    if (ok && workflow.teardown?.length) {
+      console.log('-- teardown');
+      await vu.runTeardown();
+    }
     console.log(failures ? `\n${failures} step(s) failed` : '\nAll steps passed');
     process.exitCode = failures ? 1 : 0;
   });
@@ -147,13 +155,15 @@ program
       .default('per-vu'),
   )
   .option('--think-scale <x>', 'multiply recorded think times (0 = no think time)', (v) => Number(v), 1)
+  .option('--fresh-session', 'log in again with a clean session at the start of every iteration (the teardown/logout steps run first)', false)
   .option('--timeout <ms>', 'request timeout', (v) => Number(v), 30000)
   .option('-v, --var <key=value>', 'override a workflow variable, e.g. baseUrl=http://staging (repeatable)', collect, [])
   .option('--run-id <id>', 'custom run id')
   .option('--start-delay <sec>', 'time for workers to pick up jobs before VU #0 starts', (v) => Number(v))
   .option('--report-dir <dir>', 'report output directory', 'reports')
-  .option('--samples <n>', 'successful calls per step kept in full (request, headers, body, response) in the report', (v) => Number(v), DEFAULT_CAPTURE.okSamples)
-  .option('--error-samples <n>', 'failed calls per step kept in full', (v) => Number(v), DEFAULT_CAPTURE.errorSamples)
+  .option('--samples <n>', 'keep only the first n successful calls per step in full (default: every call is kept)', (v) => Number(v))
+  .option('--error-samples <n>', 'keep only the first n failed calls per step in full (default: every call is kept)', (v) => Number(v))
+  .option('--max-calls <n>', 'stop keeping call details after this many calls (default 100000)', (v) => Number(v))
   .option('--body-kb <n>', 'cut request/response bodies in the report after this many KB', (v) => Number(v), DEFAULT_CAPTURE.bodyKb)
   .option('--no-mask', 'show Authorization/Cookie headers and password/token fields in the report instead of masking them')
   .action(async (file: string, o) => {
@@ -173,7 +183,15 @@ program
       usersMode: o.usersMode as UsersMode,
       thinkTimeScale: o.thinkScale,
       requestTimeoutMs: o.timeout,
-      capture: { okSamples: o.samples, errorSamples: o.errorSamples, bodyKb: o.bodyKb, maskSecrets: o.mask },
+      freshSession: o.freshSession,
+      capture: {
+        okSamples: o.samples ?? DEFAULT_CAPTURE.okSamples,
+        errorSamples: o.errorSamples ?? DEFAULT_CAPTURE.errorSamples,
+        bodyKb: o.bodyKb,
+        maskSecrets: o.mask,
+        keepAll: o.samples === undefined && o.errorSamples === undefined,
+        ...(o.maxCalls ? { maxCalls: o.maxCalls } : {}),
+      },
       runId: o.runId,
       reportDir: o.reportDir,
       startDelaySec: o.startDelay,
@@ -211,7 +229,7 @@ program
   .action(async (runId: string, o) => {
     const backend = createBackend('distributed');
     const run = await backend.state.loadRun(runId);
-    const order = run ? [...run.workflow.setup, ...run.workflow.steps].map((s) => s.name) : [];
+    const order = run ? [...run.workflow.setup, ...run.workflow.steps, ...(run.workflow.teardown ?? [])].map((s) => s.name) : [];
     const stats = await backend.state.loadStats(runId, order);
     printSummary(stats);
     const samples = await backend.state.loadSamples(runId);

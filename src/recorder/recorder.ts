@@ -4,13 +4,16 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium, type BrowserContext, type Page, type Request } from 'playwright';
-import type { RecordedExchange, Recording } from '../types.js';
-import { errorMessage, log } from '../util.js';
+import type { RecordedExchange, Recording, TypedInput } from '../types.js';
+import { addTyped, TYPED_INPUT_SCRIPT } from './typed-inputs.js';
+import { errorMessage, log, sleep } from '../util.js';
 
 export interface RecordOptions {
   url: string;
   userFields?: Record<string, string>;
   headless?: boolean;
+  /** chrome (installed Google Chrome, default), msedge, or chromium (Playwright's bundled browser) */
+  browser?: string;
   /** stop automatically after N seconds (otherwise: close the browser or call stop()) */
   timeoutSec?: number;
   /** optional: automate the flow instead of clicking manually (module exporting default async (page, userFields) => {}) */
@@ -102,8 +105,10 @@ export class RecordingSession extends EventEmitter {
       // incognito-like session that many apps detect (tiny storage quota) and then lock their login form.
       profileDir = mkdtempSync(join(tmpdir(), 'lt-record-'));
       context = await chromium.launchPersistentContext(profileDir, {
-        // The installed Google Chrome (not Playwright's bundled Chromium): some apps only accept real Chrome.
-        channel: 'chrome',
+        // The installed Google Chrome by default (not Playwright's bundled Chromium): some apps only accept real Chrome.
+        ...((this.opts.browser ?? 'chrome') === 'chromium' ? {} : { channel: this.opts.browser ?? 'chrome' }),
+        // a first start with a fresh profile can be slow on a busy or virus-scanned PC
+        timeout: 120_000,
         headless: this.opts.headless ?? false,
         // Service workers are blocked so every request is issued (and captured) by the page itself;
         // otherwise requests served by a worker are invisible or have no page attached.
@@ -111,6 +116,10 @@ export class RecordingSession extends EventEmitter {
         viewport: null,
         serviceWorkers: 'block',
       });
+      // remember what is typed into the page's fields, so each value can later be followed to the requests that carry it
+      const typedInputs: TypedInput[] = [];
+      await context.exposeBinding('__ltTyped', (_src, d: Omit<TypedInput, 'at'>) => addTyped(typedInputs, d));
+      await context.addInitScript(TYPED_INPUT_SCRIPT);
       const page = context.pages()[0] ?? (await context.newPage());
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
 
@@ -180,6 +189,18 @@ export class RecordingSession extends EventEmitter {
       context.on('requestfinished', safe('requestfinished', (req: Request) => capture(req)));
       context.on('requestfailed', safe('requestfailed', (req: Request) => capture(req, req.failure()?.errorText ?? 'failed')));
 
+      // Requests still in flight when recording ends would be lost (or recorded as aborted): wait for them to settle.
+      let inflight = 0;
+      let contextClosed = false;
+      context.on('request', () => inflight++);
+      context.on('requestfinished', () => inflight--);
+      context.on('requestfailed', () => inflight--);
+      const settle = async (maxMs: number) => {
+        const until = Date.now() + maxMs;
+        while (inflight > 0 && !contextClosed && Date.now() < until) await sleep(50);
+        if (!contextClosed) await sleep(150); // let the finished/failed handlers start their captures
+      };
+
       const trackPage = (p: Page) => {
         p.on(
           'framenavigated',
@@ -192,7 +213,10 @@ export class RecordingSession extends EventEmitter {
       };
       trackPage(page);
       context.on('page', safe('page', trackPage));
-      context.on('close', () => this.finish());
+      context.on('close', () => {
+        contextClosed = true;
+        this.finish();
+      });
       const timer = this.opts.timeoutSec ? setTimeout(() => this.finish(), this.opts.timeoutSec * 1000) : undefined;
 
       log('record', `Opening ${this.opts.url}`);
@@ -205,11 +229,13 @@ export class RecordingSession extends EventEmitter {
         log('record', `Running flow script ${this.opts.script}`);
         await mod.default(page, this.opts.userFields ?? {});
         await page.waitForLoadState('networkidle').catch(() => undefined);
+        await settle(8000);
         this.finish();
       }
 
       await finished;
       if (timer) clearTimeout(timer);
+      await settle(3000);
       await Promise.allSettled([...pending]);
       await cleanup();
 
@@ -222,6 +248,7 @@ export class RecordingSession extends EventEmitter {
         navigations,
         exchanges,
         userFields: this.opts.userFields,
+        typedInputs,
       };
       this.emit('finished', recording);
       return recording;

@@ -105,7 +105,7 @@ export function CallRow({ call: c, defaultOpen }: { call: CallSample; defaultOpe
         <span className={`badge ${bad ? 'bad' : 'good'}`}>{status ?? 'no response'}</span>
         <span className="num">{fmt.ms(c.durationMs)}</span>
         <span className="faint">
-          {c.phase === 'setup' ? 'setup' : `iteration ${c.iteration + 1}`} · user {c.vu + 1} · {new Date(c.at).toLocaleTimeString()}
+          {c.phase === 'setup' ? 'setup' : c.phase === 'teardown' ? 'teardown' : `iteration ${c.iteration + 1}`} · user {c.vu + 1} · {new Date(c.at).toLocaleTimeString()}
         </span>
         {c.auth === 'applied' && <span className="chip">auth sent</span>}
         {c.auth === 'skipped' && <span className="chip">no auth yet</span>}

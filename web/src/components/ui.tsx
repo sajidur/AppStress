@@ -187,6 +187,7 @@ export const fmt = {
   ms: (v: number | null | undefined) => (v === null || v === undefined || Number.isNaN(v) ? '—' : v >= 10_000 ? `${(v / 1000).toFixed(1)} s` : v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${Math.round(v)} ms`),
   pct: (v: number | null | undefined, digits = 2) => (v === null || v === undefined ? '—' : `${(v * 100).toFixed(digits)}%`),
   num: (v: number | null | undefined) => (v === null || v === undefined ? '—' : v.toLocaleString()),
+  bytes: (v: number | null | undefined) => (v === null || v === undefined ? '—' : v < 1024 ? `${v} B` : v < 1024 * 1024 ? `${(v / 1024).toFixed(1)} KB` : v < 1024 ** 3 ? `${(v / 1024 / 1024).toFixed(1)} MB` : `${(v / 1024 ** 3).toFixed(2)} GB`),
   rps: (v: number | null | undefined) => (v === null || v === undefined ? '—' : v >= 100 ? v.toFixed(0) : v.toFixed(1)),
   dur: (sec: number | null | undefined) => {
     if (sec === null || sec === undefined) return '—';

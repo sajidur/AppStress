@@ -1,5 +1,5 @@
 import type { Extractor } from '../types.js';
-import { getPath } from './jsonpath.js';
+import { getPathAll, pickOne } from './jsonpath.js';
 
 export interface ResponseView {
   status: number;
@@ -35,7 +35,7 @@ export function runExtractor(ex: Extractor, res: ResponseView): string | undefin
       return m ? (m[ex.group ?? 1] ?? m[0]) : undefined;
     }
     case 'body': {
-      const v = getPath(json(res), ex.path ?? '$');
+      const v = pickOne(getPathAll(json(res), ex.path ?? '$'), ex.select ?? 'first');
       if (v === undefined || v === null) return undefined;
       return typeof v === 'object' ? JSON.stringify(v) : String(v);
     }

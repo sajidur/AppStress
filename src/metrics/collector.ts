@@ -1,6 +1,6 @@
 import type { MetricSink } from '../engine/executor.js';
-import type { CallSampler } from '../engine/sampling.js';
-import type { CallSample, CaptureSettings } from '../types.js';
+import { MAX_SAMPLE_BYTES, sampleBytes, type CallSampler } from '../engine/sampling.js';
+import { DEFAULT_MAX_CALLS, type CallSample, type CaptureSettings } from '../types.js';
 import { bucketOf } from './histogram.js';
 
 export interface StepAgg {
@@ -40,6 +40,8 @@ const NO_CAPTURE: CaptureSettings = { okSamples: 0, errorSamples: 0, bodyKb: 16,
 export class MetricsCollector implements MetricSink, CallSampler {
   private snap = emptySnapshot();
   private kept = new Map<string, number>();
+  private total = 0;
+  private bytes = 0;
 
   /** capture: how many calls per step keep full details (default: none) */
   constructor(readonly capture: CaptureSettings = NO_CAPTURE) {}
@@ -47,12 +49,15 @@ export class MetricsCollector implements MetricSink, CallSampler {
   /** Per worker and run: the first okSamples successful and errorSamples failed calls of every step. */
   want(step: string, failed: boolean): boolean {
     if (step.startsWith('__')) return false;
+    if (this.capture.keepAll) return this.total < (this.capture.maxCalls ?? DEFAULT_MAX_CALLS) && this.bytes < MAX_SAMPLE_BYTES;
     return (this.kept.get(`${step}|${failed}`) ?? 0) < (failed ? this.capture.errorSamples : this.capture.okSamples);
   }
 
   add(sample: CallSample): void {
     const key = `${sample.step}|${sample.outcome === 'error'}`;
     this.kept.set(key, (this.kept.get(key) ?? 0) + 1);
+    this.total++;
+    this.bytes += sampleBytes(sample);
     this.snap.samples.push(sample);
   }
 

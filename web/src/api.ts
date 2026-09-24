@@ -70,6 +70,7 @@ export const api = {
   suggestUserFields: (id: string) => request<{ userFields: Record<string, string> }>('GET', `/tests/${enc(id)}/workflow/suggest-user-fields`),
   buildWorkflow: (id: string, opts: BuildOptionsInput) => request<{ workflow: Workflow; report: BuildReport }>('POST', `/tests/${enc(id)}/workflow/build`, opts),
   responseSample: (id: string, exchangeId: number) => request<ResponseSample>('GET', `/tests/${enc(id)}/workflow/response-sample/${exchangeId}`),
+  typedInputs: (id: string) => request<{ typed: { index: number; field: string; label?: string; type: string; value: string; suggestedColumn?: string; sentAs?: string[] }[] }>('GET', `/tests/${enc(id)}/workflow/typed-inputs`),
   saveWorkflow: (id: string, wf: Workflow) => request<{ workflow: Workflow }>('PUT', `/tests/${enc(id)}/workflow`, wf),
   validateWorkflow: (id: string, b: { userIndex: number; iterations: number }) => request<ValidationResult>('POST', `/tests/${enc(id)}/workflow/validate`, b),
 
@@ -81,7 +82,26 @@ export const api = {
   getRun: (id: string) => request<RunDetails>('GET', `/runs/${enc(id)}`),
   stopRun: (id: string) => request<void>('POST', `/runs/${enc(id)}/stop`),
   deleteRun: (id: string) => request<void>('DELETE', `/runs/${enc(id)}`),
-  runSamples: (id: string) => request<{ capture: CaptureSettings | null; steps: { name: string; request: StepRequest }[]; samples: CallSample[] }>('GET', `/runs/${enc(id)}/samples`),
+  runSamples: (id: string) =>
+    request<{ capture: CaptureSettings | null; steps: { name: string; request: StepRequest }[]; groups: { step: string; outcome: 'ok' | 'error'; count: number }[]; samples: CallSample[] }>('GET', `/runs/${enc(id)}/samples`),
+  runCalls: (id: string, q: { step?: string; outcome?: 'ok' | 'error'; offset?: number; limit?: number }) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== '') p.set(k, String(v));
+    return request<{ total: number; calls: CallSample[] }>('GET', `/runs/${enc(id)}/calls?${p}`);
+  },
+  deleteRunCalls: (id: string) => request<{ deleted: number }>('DELETE', `/runs/${enc(id)}/calls`),
+  deleteRuns: (b: { ids?: string[]; all?: boolean; only?: 'calls' }) => request<{ deleted: number; skipped: number }>('POST', '/runs/delete', b),
+  testData: (id: string) =>
+    request<{
+      recording: { exchanges: number; bytes: number } | null;
+      users: { rows: number; bytes: number } | null;
+      runs: { count: number; bytes: number; active: number };
+      calls: { count: number; bytes: number };
+      workflow: { steps: number } | null;
+      recordingActive: boolean;
+    }>('GET', `/tests/${enc(id)}/data`),
+  clearTestData: (id: string, what: { recording?: boolean; workflow?: boolean; users?: boolean; runs?: boolean; calls?: boolean }) =>
+    request<{ cleared: Record<string, number | boolean> }>('POST', `/tests/${enc(id)}/clear`, what),
   runEventsUrl: (id: string) => `/api/runs/${enc(id)}/events`,
   reportUrl: (id: string, kind: 'report.html' | 'report.json' | 'junit.xml') => `/api/runs/${enc(id)}/${kind}`,
 };

@@ -6,7 +6,7 @@ import { useAsync } from '../../hooks';
 import { METRICS, metricInfo } from '../../thresholds';
 import type { CaptureSettings, TestSettings, Threshold, ThresholdOp, UsersMode } from '../../types';
 
-const DEFAULT_CAPTURE: CaptureSettings = { okSamples: 3, errorSamples: 5, bodyKb: 16, maskSecrets: true };
+const DEFAULT_CAPTURE: CaptureSettings = { okSamples: 3, errorSamples: 5, bodyKb: 16, maskSecrets: true, keepAll: true, maxCalls: 100_000 };
 import type { TabProps } from '../TestPage';
 
 const USERS_MODES: { value: UsersMode; label: string; help: string }[] = [
@@ -43,7 +43,7 @@ export function SettingsTab({ test, reload }: TabProps) {
   };
   const current: TestSettings = { ...s, variables: Object.fromEntries(vars.filter(([k]) => k.trim())) };
   const dirty = JSON.stringify(current) !== JSON.stringify({ ...test.settings, variables: test.settings.variables ?? {} });
-  const stepNames = useMemo(() => [...(test.workflow?.setup ?? []), ...(test.workflow?.steps ?? [])].map((x) => x.name), [test.workflow]);
+  const stepNames = useMemo(() => [...(test.workflow?.setup ?? []), ...(test.workflow?.steps ?? []), ...(test.workflow?.teardown ?? [])].map((x) => x.name), [test.workflow]);
 
   const warnings: string[] = [];
   const capacity = system.data?.capacity ?? 0;
@@ -106,6 +106,35 @@ export function SettingsTab({ test, reload }: TabProps) {
         </div>
       </Card>
 
+      <Card
+        title="Sessions and logout"
+        hint="Your application keeps the login in a cookie. While that cookie is valid the server treats every request as the same user, and may ignore a second login. Every virtual user has its own cookies, so users never share a session. These options control what happens when a user's session should end."
+      >
+        <div className="stack">
+          <label className="check">
+            <input type="checkbox" checked={!!s.freshSession || s.usersMode === 'per-iteration'} disabled={s.usersMode === 'per-iteration'} onChange={(e) => set({ freshSession: e.target.checked || undefined })} />
+            <span>
+              <b>Log in again at the start of every iteration</b>, with a clean session (cookies and saved values cleared)
+              {s.usersMode === 'per-iteration' && <span className="faint"> — already the case: "New user every iteration" starts a clean session for every user</span>}
+            </span>
+          </label>
+          <div className="faint" style={{ fontSize: 13 }}>
+            Without it, a virtual user logs in once and keeps that session for all its iterations. Users mode (above) decides <i>which</i> user logs in: one per virtual user, or the next one in the file every iteration.
+          </div>
+          {(test.workflow?.teardown?.length ?? 0) > 0 ? (
+            <div className="callout good">
+              ✓ The workflow has {test.workflow!.teardown!.length} logout step{test.workflow!.teardown!.length === 1 ? '' : 's'} ({test.workflow!.teardown!.map((t) => t.name).join(', ')}). They run when a user's session ends: after the last iteration, and before the next login when a new session starts.
+              A run you stop does not send them.
+            </div>
+          ) : (
+            <div className="callout warn">
+              The workflow has no logout step, so users stay signed in on the server after their session ends
+              {s.freshSession || s.usersMode === 'per-iteration' ? ' and every new session adds another open one' : ''}. Add your logout call under <b>Teardown</b> on the <Link to="../workflow">Workflow</Link> tab.
+            </div>
+          )}
+        </div>
+      </Card>
+
       <Card title="Environment" hint="Point the same test at another environment without re-recording.">
         <div className="stack">
           <Field label="Base URL override" help={`Recorded: ${test.workflow?.variables.baseUrl ?? '—'}. Leave empty to use the recorded one.`}>
@@ -138,15 +167,37 @@ export function SettingsTab({ test, reload }: TabProps) {
 
       <Card
         title="Call details in reports"
-        hint="Every request is counted in the numbers. Full details (URL, headers, body, response) are kept only for a few calls per step, so runs with millions of requests stay small."
+        hint="Every request is counted in the numbers. By default the full details of every call (URL, headers, body, response) are kept too. For very long or very busy runs you can keep only a few calls per step instead."
       >
         {(() => {
           const cap = s.capture ?? DEFAULT_CAPTURE;
+          // settings saved before "every call" existed have no keepAll: they keep every call now
+          const keepAll = cap.keepAll ?? !(cap.okSamples === 0 && cap.errorSamples === 0);
           const setCap = (patch: Partial<CaptureSettings>) => set({ capture: { ...cap, ...patch } });
+          const maxCalls = cap.maxCalls ?? 100_000;
+          // a call holds two headers blocks and two bodies (each cut at bodyKb) plus some overhead
+          const perCallKb = Math.max(2, cap.bodyKb * 2 + 2);
           return (
             <div className="stack">
-              <div className="grid-3">
-                <NumberField label="Successful calls kept per step" help="The first ones of each step. 0 = none." value={cap.okSamples} onChange={(v) => setCap({ okSamples: v })} />
+              <div className="seg" role="radiogroup" aria-label="How many calls to keep" style={{ alignSelf: 'flex-start' }}>
+                <button role="radio" aria-checked={keepAll} className={keepAll ? 'on' : ''} onClick={() => setCap({ keepAll: true })}>
+                  Every call
+                </button>
+                <button role="radio" aria-checked={!keepAll} className={!keepAll ? 'on' : ''} onClick={() => setCap({ keepAll: false })}>
+                  A few per step
+                </button>
+              </div>
+              {keepAll && (
+                <div className="stack" style={{ gap: 8 }}>
+                  <NumberField label="Stop keeping details after this many calls" help="A safety limit. Every request is still counted in the numbers after it is reached." value={maxCalls} min={1} onChange={(v) => setCap({ maxCalls: Math.min(1_000_000, Math.max(1, Math.round(v) || 1)) })} />
+                  <div className={maxCalls * perCallKb > 500 * 1024 ? 'callout warn' : 'callout'}>
+                    Every call keeps its full request and response, up to {cap.bodyKb} KB per body. That is at most about <b>{fmt.bytes(maxCalls * perCallKb * 1024)}</b> for {fmt.num(maxCalls)} calls, kept in memory during the run and saved with its results.
+                    Long runs with a high request rate are better served by a few calls per step, or by a lower body size.
+                  </div>
+                </div>
+              )}
+              <div className="grid-3" style={keepAll ? { opacity: 0.55 } : undefined}>
+                <NumberField label="Successful calls kept per step" help={keepAll ? 'Not used while every call is kept.' : 'The first ones of each step. 0 = none.'} value={cap.okSamples} onChange={(v) => setCap({ okSamples: v })} />
                 <NumberField label="Failed calls kept per step" help="Failures are what you debug, so keep more of them." value={cap.errorSamples} onChange={(v) => setCap({ errorSamples: v })} />
                 <NumberField label="Cut bodies after (KB)" help="Long request and response bodies are cut here." value={cap.bodyKb} min={1} onChange={(v) => setCap({ bodyKb: v })} />
               </div>

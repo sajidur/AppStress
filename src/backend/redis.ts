@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import type { SharedCache } from '../engine/executor.js';
 import type { Snapshot } from '../metrics/collector.js';
 import { computeStats, emptyRawStep, type RawRun, type RunStats } from '../metrics/stats.js';
-import { DEFAULT_CAPTURE, type CallSample, type RunConfig, type Workflow } from '../types.js';
+import { DEFAULT_CAPTURE, DEFAULT_MAX_CALLS, type CallSample, type RunConfig, type Workflow } from '../types.js';
 import { STALE_MS, type StateBackend, type WorkerInfo } from './types.js';
 
 /** All Redis keys used by one run live under lt:<runId>:* */
@@ -159,7 +159,10 @@ export class RedisState implements StateBackend {
     if (snap.samples.length) {
       const cap = await this.captureOf(runId);
       for (const s of snap.samples) {
-        p.pushsample(keys.samples(runId), keys.sampleCounts(runId), `${s.step}|${s.outcome}`, s.outcome === 'ok' ? cap.okSamples : cap.errorSamples, JSON.stringify(s));
+        // keep-all runs share one counter (the global limit); otherwise every step and outcome has its own
+        const field = cap.keepAll ? 'all' : `${s.step}|${s.outcome}`;
+        const limit = cap.keepAll ? (cap.maxCalls ?? DEFAULT_MAX_CALLS) : s.outcome === 'ok' ? cap.okSamples : cap.errorSamples;
+        p.pushsample(keys.samples(runId), keys.sampleCounts(runId), field, limit, JSON.stringify(s));
       }
     }
     await p.exec();

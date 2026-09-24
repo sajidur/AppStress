@@ -29,6 +29,7 @@ async function main() {
     apiToken: process.env.LT_API_TOKEN || undefined,
     webDir: process.env.LT_WEB_DIR,
     recorderHeadless: config.recorderHeadless,
+    recorderBrowser: config.recorderBrowser,
     recorderEnabled: config.recorderEnabled,
     redisRunTtlSec: config.redisRunTtlSec,
     maxUploadMb: config.maxUploadMb,

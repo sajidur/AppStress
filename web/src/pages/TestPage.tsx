@@ -4,6 +4,7 @@ import { api } from '../api';
 import { ErrorBox, Loading, useAction } from '../components/ui';
 import { useAsync } from '../hooks';
 import type { TestDetails } from '../types';
+import { DataTab } from './tabs/DataTab';
 import { RecordTab } from './tabs/RecordTab';
 import { RunsTab } from './tabs/RunsTab';
 import { SettingsTab } from './tabs/SettingsTab';
@@ -84,6 +85,9 @@ export function TestPage() {
             {s.label}
           </NavLink>
         ))}
+        <NavLink to="data" className="stepper-extra">
+          Data &amp; cleanup
+        </NavLink>
       </nav>
       <Routes>
         <Route index element={<Navigate to={next} replace />} />
@@ -92,6 +96,7 @@ export function TestPage() {
         <Route path="workflow" element={<WorkflowTab {...props} />} />
         <Route path="settings" element={<SettingsTab {...props} />} />
         <Route path="runs" element={<RunsTab {...props} />} />
+        <Route path="data" element={<DataTab {...props} />} />
       </Routes>
     </div>
   );

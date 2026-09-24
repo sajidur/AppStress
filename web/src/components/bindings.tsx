@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
 import {
   availableVars,
+  chainFor,
   extractorVarNames,
   filterFor,
   placeholder,
@@ -16,6 +17,7 @@ import {
   type VarInfo,
 } from '../bindings';
 import { useAsync } from '../hooks';
+import { FILTERS } from '../../../src/engine/filter-names';
 import type { Extractor, Workflow } from '../types';
 import { Modal, Spinner } from './ui';
 
@@ -288,6 +290,8 @@ const GROUPS: { kind: VarInfo['kind']; title: string }[] = [
 export function VarMenu({ ctx, filter, onInsert }: { ctx: BindContext; filter?: string; onInsert: (text: string) => void }) {
   const [open, setOpen] = useState(false);
   const [dialog, setDialog] = useState(false);
+  // how the value is sent: as it is, or encoded (Base64, hex, a hash) the way the server expects it
+  const [encoding, setEncoding] = useState('');
   const box = useRef<HTMLDivElement>(null);
   const vars = useMemo(() => availableVars(ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars), [ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars]);
   const canBind = stepsBefore(ctx.workflow, ctx.ref).length > 0;
@@ -311,6 +315,22 @@ export function VarMenu({ ctx, filter, onInsert }: { ctx: BindContext; filter?: 
       </button>
       {open && (
         <div className="var-pop" role="listbox">
+          <label className="var-encode" title={FILTERS.find((f) => f.name === encoding)?.help ?? 'The value is sent exactly as it is'}>
+            <span>Send it as</span>
+            <select aria-label="Send the value as" value={encoding} onChange={(e) => setEncoding(e.target.value)}>
+              <option value="">as it is</option>
+              {(['encode', 'hash', 'decode', 'other'] as const).map((kind) => (
+                <optgroup key={kind} label={{ encode: 'Encode', hash: 'Hash', decode: 'Decode', other: 'Other' }[kind]}>
+                  {FILTERS.filter((f) => f.kind === kind && f.name !== 'urlencode' && f.name !== 'json').map((f) => (
+                    <option key={f.name} value={f.name}>
+                      {f.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </label>
+          {encoding && <div className="var-encode-help">{FILTERS.find((f) => f.name === encoding)?.help}</div>}
           {GROUPS.map((g) => {
             const list = vars.filter((v) => v.kind === g.kind);
             if (!list.length) return null;
@@ -325,7 +345,7 @@ export function VarMenu({ ctx, filter, onInsert }: { ctx: BindContext; filter?: 
                     key={v.name}
                     className="var-item"
                     onClick={() => {
-                      onInsert(placeholder(v.name, filter));
+                      onInsert(placeholder(v.name, chainFor(encoding || undefined, filter)));
                       setOpen(false);
                     }}
                   >
@@ -356,7 +376,7 @@ export function VarMenu({ ctx, filter, onInsert }: { ctx: BindContext; filter?: 
           onClose={() => setDialog(false)}
           onDone={(v) => {
             setDialog(false);
-            onInsert(placeholder(v, filter));
+            onInsert(placeholder(v, chainFor(encoding || undefined, filter)));
           }}
         />
       )}

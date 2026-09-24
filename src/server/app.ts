@@ -16,7 +16,9 @@ import { ACTIVE_STATUSES, type Store } from './db.js';
 import { EventHub, streamEvents } from './events.js';
 import {
   buildOptionsSchema,
+  clearTestSchema,
   createTestSchema,
+  deleteRunsSchema,
   harUploadSchema,
   settingsSchema,
   startRecordingSchema,
@@ -26,9 +28,9 @@ import {
   validateSchema,
   workflowSchema,
 } from './schemas.js';
-import { applySettings, HttpError, maskRows, parseUsersFile, sampleExchange, suggestUserFields, validateWorkflow } from './services/helpers.js';
+import { applySettings, HttpError, maskRows, parseUsersFile, sampleExchange, suggestTypedColumns, suggestUserFields, validateWorkflow } from './services/helpers.js';
 import { recordingTopic, RecordingService } from './services/recordings.js';
-import { RunService, runTopic } from './services/runs.js';
+import { groupCounts, limitPerGroup, RunService, runTopic } from './services/runs.js';
 
 export interface AppDeps {
   store: Store;
@@ -39,6 +41,8 @@ export interface AppDeps {
   apiToken?: string;
   webDir?: string;
   recorderHeadless: boolean;
+  /** chrome (default), msedge or chromium */
+  recorderBrowser?: string;
   recorderEnabled: boolean;
   redisRunTtlSec: number;
   maxUploadMb: number;
@@ -67,8 +71,18 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     logger: { level: deps.logLevel ?? process.env.LOG_LEVEL ?? 'info' },
     bodyLimit: deps.maxUploadMb * 1024 * 1024,
   });
-  const recordings = new RecordingService(store, hub, app.log, deps.recorderHeadless);
+  const recordings = new RecordingService(store, hub, app.log, deps.recorderHeadless, deps.recorderBrowser);
   const runs = new RunService(store, backend, hub, app.log, deps.redisRunTtlSec);
+
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+    try {
+      done(null, body === '' ? {} : JSON.parse(body as string));
+    } catch {
+      const err = new Error('Request body is not valid JSON') as Error & { statusCode: number };
+      err.statusCode = 400;
+      done(err, undefined);
+    }
+  });
 
   /* ---------------------------------------------------------------- errors */
 
@@ -146,6 +160,7 @@ export async function buildApp(deps: AppDeps): Promise<App> {
       capacity: workers.reduce((s, w) => s + w.concurrency, 0),
       embeddedWorker: deps.worker?.status ?? null,
       recorderHeadless: deps.recorderHeadless,
+      recorderBrowser: deps.recorderBrowser ?? 'chrome',
       recorderEnabled: deps.recorderEnabled,
     };
   });
@@ -173,6 +188,34 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     if (recordings.isActive(req.params.id)) throw new HttpError(409, 'Stop the active recording first');
     if (!store.deleteTest(req.params.id)) throw new HttpError(404, 'Test not found');
     return reply.status(204).send();
+  });
+
+  /** What is stored for the test and roughly how much space it takes. */
+  app.get('/api/tests/:id/data', async (req: IdParams) => {
+    const test = requireTest(req.params.id);
+    return { ...store.testDataSummary(test.id), workflow: test.workflow ? { steps: test.workflow.setup.length + test.workflow.steps.length + (test.workflow.teardown?.length ?? 0) } : null, recordingActive: recordings.isActive(test.id) };
+  });
+
+  /** Clear parts of a test's data (recording, workflow, users file, run results, or just the call details). The test itself stays. */
+  app.post('/api/tests/:id/clear', async (req: IdParams) => {
+    const test = requireTest(req.params.id);
+    const what = parse(clearTestSchema, req.body);
+    if (what.recording && recordings.isActive(test.id)) throw new HttpError(409, 'Stop the active recording first');
+    const active = store.listRuns({ testId: test.id, statuses: ACTIVE_STATUSES, limit: 10 });
+    if ((what.runs || what.calls) && active.length) throw new HttpError(409, 'Stop the active run first');
+    const done: Record<string, number | boolean> = {};
+    if (what.recording) done.recording = store.deleteRecording(test.id);
+    if (what.workflow) {
+      store.clearWorkflow(test.id);
+      done.workflow = true;
+    }
+    if (what.users) {
+      store.deleteDataset(test.id);
+      done.users = true;
+    }
+    if (what.runs) done.runs = store.deleteRuns({ testId: test.id }).deleted;
+    else if (what.calls) done.calls = store.listRuns({ testId: test.id, limit: 100_000 }).reduce((n, r) => n + store.deleteRunCalls(r.id), 0);
+    return { cleared: done, ...store.testDataSummary(test.id) };
   });
 
   app.post('/api/tests/:id/duplicate', async (req: IdParams, reply) => {
@@ -281,6 +324,14 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     return { userFields: suggestUserFields(rec.recording, rows) };
   });
 
+  /** What was typed into the page while recording (passwords hidden), with the users-file column each value probably comes from. */
+  app.get('/api/tests/:id/workflow/typed-inputs', async (req: IdParams) => {
+    requireTest(req.params.id);
+    const rec = store.getRecording(req.params.id);
+    const meta = store.getDatasetMeta(req.params.id);
+    return { typed: suggestTypedColumns(rec?.recording.typedInputs ?? [], meta?.columns ?? [], meta ? store.getDatasetRows(req.params.id) : [], rec?.recording.exchanges ?? []) };
+  });
+
   /** The recorded response of an exchange: values a later request can bind to (JSON paths, headers, cookies, hidden fields). */
   app.get('/api/tests/:id/workflow/response-sample/:exchangeId', async (req: FastifyRequest<{ Params: { id: string; exchangeId: string } }>) => {
     requireTest(req.params.id);
@@ -296,8 +347,11 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     const rec = store.getRecording(test.id);
     if (!rec) throw new HttpError(400, 'Record the flow (or upload a HAR) first');
     const opts = parse(buildOptionsSchema, req.body);
-    const { workflow, report } = buildWorkflow(rec.recording, { ...opts, name: test.name });
-    if (!workflow.setup.length && !workflow.steps.length) {
+    // values typed while recording are mapped to users-file columns by position, so passwords never travel to the browser
+    const typed = rec.recording.typedInputs ?? [];
+    const fromTyped = Object.fromEntries(Object.entries(opts.typedMap ?? {}).flatMap(([i, col]) => (typed[Number(i)] ? [[col, typed[Number(i)].value]] : [])));
+    const { workflow, report } = buildWorkflow(rec.recording, { ...opts, userFields: { ...opts.userFields, ...fromTyped }, name: test.name });
+    if (!workflow.setup.length && !workflow.steps.length && !workflow.teardown?.length) {
       throw new HttpError(400, 'No API requests matched the filters. Check the domains / exclude options or re-record the flow.');
     }
     store.updateTest(test.id, { workflow, buildOptions: opts, buildReport: report });
@@ -370,8 +424,48 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     const run = requireRun(req.params.id);
     const wf = store.getRunDetails(run.id)?.workflow;
     // the request as configured (variables not yet filled in), so each call can be compared with its definition
-    const steps = [...(wf?.setup ?? []), ...(wf?.steps ?? [])].map((s) => ({ name: s.name, request: s.request }));
-    return { capture: run.config?.capture ?? null, steps, samples: await runs.samples(run.id) };
+    const steps = [...(wf?.setup ?? []), ...(wf?.steps ?? []), ...(wf?.teardown ?? [])].map((s) => ({ name: s.name, request: s.request }));
+    // the first calls of every step and outcome; page through the rest with /calls
+    const perGroup = Math.min(Math.max(Number((req.query as { perGroup?: string }).perGroup ?? 100) || 100, 1), 1000);
+    const live = ACTIVE_STATUSES.includes(run.status);
+    const all = live ? await runs.samples(run.id) : null;
+    const groups = all ? groupCounts(all) : store.runCallGroups(run.id);
+    return { capture: run.config?.capture ?? null, steps, groups, samples: all ? limitPerGroup(all, perGroup) : store.getRunSamples(run.id, perGroup) };
+  });
+
+  /** A page of the kept calls of a run, optionally of one step / outcome / status code. */
+  app.get('/api/runs/:id/calls', async (req: FastifyRequest<{ Params: { id: string }; Querystring: { step?: string; outcome?: string; status?: string; limit?: string; offset?: string } }>) => {
+    const run = requireRun(req.params.id);
+    const q = req.query;
+    const limit = Math.min(Math.max(Number(q.limit ?? 25) || 25, 1), 200);
+    const offset = Math.max(Number(q.offset ?? 0) || 0, 0);
+    const outcome = q.outcome === 'ok' || q.outcome === 'error' ? q.outcome : undefined;
+    const status = q.status !== undefined && q.status !== '' && !Number.isNaN(Number(q.status)) ? Number(q.status) : undefined;
+    if (ACTIVE_STATUSES.includes(run.status)) {
+      const list = (await runs.samples(run.id)).filter((c) => (!q.step || c.step === q.step) && (!outcome || c.outcome === outcome) && (status === undefined || c.response?.status === status));
+      return { total: list.length, calls: list.slice(offset, offset + limit) };
+    }
+    return store.getRunCalls(run.id, { step: q.step || undefined, outcome, status, limit, offset });
+  });
+
+  /** Remove the stored request/response details of one run (its statistics stay). */
+  app.delete('/api/runs/:id/calls', async (req: IdParams) => {
+    const run = requireRun(req.params.id);
+    if (ACTIVE_STATUSES.includes(run.status)) throw new HttpError(409, 'Stop the run before deleting its call details');
+    return { deleted: store.deleteRunCalls(run.id) };
+  });
+
+  /** Delete several runs at once (or all of them). Runs that are still active are skipped. */
+  app.post('/api/runs/delete', async (req) => {
+    const body = parse(deleteRunsSchema, req.body);
+    if (body.only === 'calls') {
+      const targets = body.ids ? body.ids.map((id) => store.getRun(id)).filter((r) => r !== null) : store.listRuns({ limit: 100_000 });
+      const done = targets.filter((r) => !ACTIVE_STATUSES.includes(r!.status));
+      let deleted = 0;
+      for (const r of done) deleted += store.deleteRunCalls(r!.id);
+      return { deleted, skipped: targets.length - done.length };
+    }
+    return store.deleteRuns(body.ids ? { ids: body.ids } : { all: true });
   });
 
   app.get('/api/runs/:id/events', async (req: IdParams, reply) => {
@@ -407,7 +501,7 @@ export async function buildApp(deps: AppDeps): Promise<App> {
     return reply
       .type('text/html; charset=utf-8')
       .header('content-disposition', `inline; filename="${run.id}.html"`)
-      .send(renderHtml(stats, { ...workflow, name: run.testName ?? workflow.name }, { verdict: run.verdict ?? undefined, thresholds: run.thresholds ?? [], samples: store.getRunSamples(run.id), capture: run.config?.capture }));
+      .send(renderHtml(stats, { ...workflow, name: run.testName ?? workflow.name }, { verdict: run.verdict ?? undefined, thresholds: run.thresholds ?? [], samples: store.getRunSamples(run.id, 30), keptTotal: store.runCallGroups(run.id).reduce((n, g) => n + g.count, 0), capture: run.config?.capture }));
   });
 
   app.get('/api/runs/:id/report.json', async (req: IdParams, reply) => {

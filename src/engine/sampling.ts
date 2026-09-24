@@ -1,4 +1,4 @@
-import type { CallSample, CaptureSettings } from '../types.js';
+import { DEFAULT_MAX_CALLS, type CallSample, type CaptureSettings } from '../types.js';
 
 /** Decides which calls keep their full details, and receives them. Implemented by the metrics collector. */
 export interface CallSampler {
@@ -79,10 +79,25 @@ export function cut(text: string | undefined, maxBytes: number): { text?: string
   return text.length > maxBytes ? { text: text.slice(0, maxBytes), truncated: true } : { text };
 }
 
+/** Roughly how much memory a kept call takes (characters of its text). */
+export function sampleBytes(s: CallSample): number {
+  let n = 300 + s.request.url.length + (s.request.body?.length ?? 0) + (s.response?.body?.length ?? 0);
+  for (const [k, v] of Object.entries(s.request.headers)) n += k.length + v.length + 4;
+  if (s.response) for (const [k, v] of Object.entries(s.response.headers)) n += k.length + v.length + 4;
+  return n;
+}
+
+/** A worker stops keeping call details after about this much text, whatever the call limit says. */
+export const MAX_SAMPLE_BYTES = 400 * 1024 * 1024;
+
 /* ------------------------------------------------------------------ merging (workers -> run) */
 
 /** Keep at most okSamples successful and errorSamples failed calls per step; earlier ones win. */
 export function mergeSamples(into: CallSample[], incoming: CallSample[], capture: CaptureSettings): void {
+  if (capture.keepAll) {
+    into.push(...incoming.slice(0, Math.max(0, (capture.maxCalls ?? DEFAULT_MAX_CALLS) - into.length)));
+    return;
+  }
   const count = new Map<string, number>();
   for (const s of into) count.set(`${s.step}|${s.outcome}`, (count.get(`${s.step}|${s.outcome}`) ?? 0) + 1);
   for (const s of incoming) {

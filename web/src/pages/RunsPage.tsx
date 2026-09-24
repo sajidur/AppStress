@@ -1,5 +1,5 @@
 import { api } from '../api';
-import { RunsTable } from '../components/RunsTable';
+import { RunsManager } from '../components/RunsManager';
 import { Card, Empty, ErrorBox, Loading } from '../components/ui';
 import { useAsync, useInterval } from '../hooks';
 
@@ -19,7 +19,7 @@ export function RunsPage() {
       {loading && !data ? (
         <Loading />
       ) : (
-        <Card bodyless>{data && data.length ? <RunsTable runs={data} showTest /> : <Empty title="No runs yet" />}</Card>
+        <Card bodyless>{data && data.length ? <RunsManager runs={data} showTest reload={reload} /> : <Empty title="No runs yet" />}</Card>
       )}
     </div>
   );

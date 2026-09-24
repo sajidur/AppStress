@@ -33,6 +33,22 @@ export interface Recording {
   exchanges: RecordedExchange[];
   /** Literal values typed during recording that should become ${user.<field>} */
   userFields?: Record<string, string>;
+  /** what the user typed into the page's input fields while recording (which field, which value) */
+  typedInputs?: TypedInput[];
+}
+
+/** A value typed into a form field of the page during recording. */
+export interface TypedInput {
+  /** epoch ms */
+  at: number;
+  /** the field's name or id */
+  field: string;
+  /** its visible label, placeholder or aria-label */
+  label?: string;
+  /** input type: text, password, email, ... */
+  type: string;
+  value: string;
+  page: string;
 }
 
 /** What a recorded response contained: values a later request can bind to. Served to the workflow editor. */
@@ -69,6 +85,12 @@ export interface Extractor {
   regex?: string;
   group?: number;
   optional?: boolean;
+  /** when the JSON path matches several values (a [*] wildcard or a [?(...)] condition): which one to take. Default: first */
+  select?: 'first' | 'last' | 'random';
+  /** used when nothing matches instead of failing the step; may contain ${templates}. Empty string is allowed */
+  default?: string;
+  /** filters applied to the value once it is read, e.g. "base64decode" or "base64decode|lower" */
+  transform?: string;
 }
 
 export interface StepRequest {
@@ -88,6 +110,11 @@ export interface Step {
   sourceId?: number;
   /** do not add the workflow-level authentication to this step (e.g. the login call itself) */
   skipAuth?: boolean;
+  /**
+   * Variables computed once before this step's request is built, e.g. {"requestId": "${$uuid}"}.
+   * Later steps can use them too, so a client-generated id can be sent in several calls.
+   */
+  set?: Record<string, string>;
   request: StepRequest;
   extract?: Extractor[];
   expect?: { status?: number[]; bodyContains?: string };
@@ -128,6 +155,11 @@ export interface Workflow {
   setup: Step[];
   /** runs every iteration */
   steps: Step[];
+  /**
+   * runs when a user's session ends, e.g. the logout call: after the last iteration of a virtual user, and, when every
+   * iteration starts a new session, before the next login. Skipped when a run is stopped. Failed steps do not stop the others.
+   */
+  teardown?: Step[];
   /** what to do when a step fails: abort the current iteration (default) or continue */
   onError?: 'abortIteration' | 'continue';
 }
@@ -144,15 +176,34 @@ export interface CaptureSettings {
   bodyKb: number;
   /** hide credentials (Authorization/Cookie headers, password and token fields) in the stored details */
   maskSecrets: boolean;
+  /** keep the details of EVERY call instead of a few per step (okSamples/errorSamples are then ignored) */
+  keepAll?: boolean;
+  /** with keepAll: stop keeping details after this many calls, to protect memory and disk. Default 100000 */
+  maxCalls?: number;
 }
 
-export const DEFAULT_CAPTURE: CaptureSettings = { okSamples: 3, errorSamples: 5, bodyKb: 16, maskSecrets: true };
+/**
+ * Every call is kept in full by default. okSamples / errorSamples only matter when keepAll is switched off
+ * ("a few per step").
+ */
+export const DEFAULT_CAPTURE: CaptureSettings = { okSamples: 3, errorSamples: 5, bodyKb: 16, maskSecrets: true, keepAll: true, maxCalls: 100_000 };
+export const DEFAULT_MAX_CALLS = 100_000;
+export const MAX_CALLS_LIMIT = 1_000_000;
+
+/**
+ * Fill in the defaults for a run. Settings saved before "every call" existed have no keepAll: they now keep every call too,
+ * except when both counts are 0, which was how capture was switched off.
+ */
+export function normalizeCapture(c?: Partial<CaptureSettings>): CaptureSettings {
+  const switchedOff = c !== undefined && c.okSamples === 0 && c.errorSamples === 0;
+  return { ...DEFAULT_CAPTURE, ...c, keepAll: c?.keepAll ?? !switchedOff };
+}
 
 /** Everything about one call: what was sent, what came back, and what was extracted from it. */
 export interface CallSample {
   step: string;
   outcome: 'ok' | 'error';
-  phase: 'setup' | 'iteration';
+  phase: 'setup' | 'iteration' | 'teardown';
   /** epoch ms when the call started */
   at: number;
   vu: number;
@@ -185,6 +236,8 @@ export interface RunConfig {
   usersCount: number;
   thinkTimeScale: number;
   requestTimeoutMs: number;
+  /** every iteration starts a new session (see TestSettings.freshSession) */
+  freshSession?: boolean;
   /** per-call detail capture; absent on runs started before this existed */
   capture?: CaptureSettings;
   /** epoch ms at which VU #0 starts */
@@ -224,6 +277,8 @@ export interface TestSettings {
   usersMode: UsersMode;
   thinkTimeScale: number;
   requestTimeoutMs: number;
+  /** log in again at the start of every iteration with a clean session (cookies and saved values cleared); the teardown (logout) runs before it */
+  freshSession?: boolean;
   /** overrides workflow.variables.baseUrl, e.g. to target staging */
   baseUrl?: string;
   variables: Record<string, string>;

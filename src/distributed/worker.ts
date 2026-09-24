@@ -133,7 +133,9 @@ export class LoadWorker {
       return 'done';
     }
     const cfg = ctx.config;
-    const shouldStop = () => ctx.stopped || this.stopping || lost() || Date.now() >= cfg.endAt;
+    // stopped / shutting down / connection lost: nothing more should be sent, not even a logout
+    const aborted = () => ctx.stopped || this.stopping || lost();
+    const shouldStop = () => aborted() || Date.now() >= cfg.endAt;
     const interrupted = (): Outcome => (lost() ? 'lost' : this.stopping ? 'requeue' : 'done');
     try {
       await sleepInterruptible(cfg.startAt + job.startDelayMs - Date.now(), shouldStop);
@@ -153,12 +155,21 @@ export class LoadWorker {
           requestTimeoutMs: cfg.requestTimeoutMs,
           thinkTimeScale: cfg.thinkTimeScale,
           shouldStop,
+          shouldAbort: aborted,
         });
         let setupDone = false;
+        // end the current session: log out, if the workflow has logout steps
+        const endSession = async () => {
+          if (setupDone && ctx.workflow.teardown?.length && !aborted()) await vu.runTeardown().catch(() => undefined);
+          setupDone = false;
+        };
         for (let i = 0; !shouldStop() && (cfg.iterations === undefined || i < cfg.iterations); i++) {
-          if (cfg.usersMode === 'per-iteration' && i > 0) {
-            vu.setUser(await this.pickUser(ctx, job.vuIndex));
-            setupDone = false;
+          if (i > 0 && (cfg.usersMode === 'per-iteration' || cfg.freshSession)) {
+            await endSession();
+            // a new user, or the same user with a clean session: the old cookies must not leak into the new login
+            if (cfg.usersMode === 'per-iteration') vu.setUser(await this.pickUser(ctx, job.vuIndex));
+            else vu.resetSession();
+            if (shouldStop()) break;
           }
           if (!setupDone) {
             setupDone = await vu.runSetup();
@@ -172,6 +183,7 @@ export class LoadWorker {
           // failed iteration (e.g. target down): back off instead of hammering in a tight error loop
           else await sleepInterruptible(1000, shouldStop);
         }
+        await endSession();
       } finally {
         ctx.active--;
         await this.reportActive(ctx);

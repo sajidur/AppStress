@@ -17,7 +17,8 @@ export type {
   UsersMode,
   RunConfig,
 } from '../../src/types';
-export type { BuildReport } from '../../src/builder/builder';
+export type { BuildReport, GeneratedValue, TypedTrace } from '../../src/builder/builder';
+export type { FlowInput, FlowIssue, FlowOutput, FlowReport, FlowStep } from '../../src/builder/flow';
 export type { RunStats, StepStats, TimelinePoint } from '../../src/metrics/stats';
 export type { RunProgress, WorkerInfo } from '../../src/distributed/controller';
 export type { StepTrace } from '../../src/engine/executor';

@@ -195,7 +195,7 @@ describe('call details in a load run and its report', () => {
         { name: 'fail', request: { method: 'POST', url: '${baseUrl}/fail', body: '{"a":1}' } },
       ],
     };
-    const capture: CaptureSettings = { okSamples: 2, errorSamples: 3, bodyKb: 16, maskSecrets: true };
+    const capture: CaptureSettings = { okSamples: 2, errorSamples: 3, bodyKb: 16, maskSecrets: true, keepAll: false };
     const cfg = await launchRun(backend, { workflow, users: [], vus: 3, rampUpSec: 0, iterations: 6, usersMode: 'per-vu', thinkTimeScale: 0, requestTimeoutMs: 5000, capture, startDelaySec: 0 });
     const { stats } = await monitorRun(backend.state, cfg, ['list', 'fail'], () => undefined, 200);
     const samples = await backend.state.loadSamples(cfg.runId);
@@ -218,6 +218,6 @@ describe('call details in a load run and its report', () => {
     assert.match(html, /503/);
     assert.match(html, /&quot;error&quot;: &quot;down&quot;/, 'response body is pretty printed and escaped');
     assert.match(html, /Configured request/);
-    assert.match(renderHtml(stats, workflow, { samples: [], capture: { ...DEFAULT_CAPTURE, okSamples: 0, errorSamples: 0 } }), /call capture was switched off/);
+    assert.match(renderHtml(stats, workflow, { samples: [], capture: { ...DEFAULT_CAPTURE, keepAll: false, okSamples: 0, errorSamples: 0 } }), /call capture was switched off/);
   });
 });

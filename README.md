@@ -88,6 +88,56 @@ Click **Build workflow**. The builder:
 
 Then review it in the step editor. For each step you can edit the URL, headers and body, and add **assertions** (expected status codes, text the response body must contain). You can add **extractors** (JSON path, header, cookie or regex), reorder or delete steps, and move steps between setup and iteration. **Edit JSON** gives full control.
 
+#### One flow, many users
+Every row of the users file becomes a virtual user. All of them run the same workflow **in parallel**, and each keeps its own cookies and its own saved values, so user A never sends user B's token or ids. Typical pipeline: log in as the user, take the token, call an API with it, take a value from that response, and use it in the next request. The **Data flow** panel on the Workflow tab shows exactly this for one user: for every request, what it takes (from the users file, an earlier response, or a generated value) and what it saves for later steps. It updates live as you edit and lists problems first:
+- a value no step produces, or one that is only produced later
+- a saved value nobody uses
+- a value that always comes from the same list position (see below)
+- a recorded token or id that stayed fixed, so every user would send the same one
+- a value you typed that never appears in any request, which usually means the page encrypts or hashes it before sending
+
+#### What the recorder works out for you
+- **Typed fields.** While recording, the recorder notes which form field each value was typed into. The build panel lists them ("Employee ID = alice") and suggests the users-file column, by matching the value and the field name. Passwords are never sent to the browser. Pick a column, or keep the recorded value.
+- **Values the browser makes up.** Request ids (a UUID in an `x-request-id`, `idempotency-key` or `clientId`) are generated fresh for every call instead of being replayed, and the same id is reused in the later calls that carry it. The current time (epoch milliseconds or seconds, ISO date) becomes `${$timestamp}`, `${$timestampSec}` or `${$isoDate}`. Ids inside URL paths are never invented. A step can also generate its own variables with `set`, for example `"set": {"requestId": "${$uuid}"}`.
+- **Encoded values.** Many pages send the user name or password encoded and the server decodes it, for example C# `Encoding.UTF8.GetString(Convert.FromBase64String(userName))`. The recorder recognises the typed value in its Base64 (also URL-safe and UTF-16), hex or hashed (MD5, SHA-1, SHA-256, SHA-512) form, in the URL, headers, JSON and form bodies, and builds each user's own encoded value: `{"userName":"${user.name|base64}"}`, `?u=${user.name|base64|urlencode}`. The typed-values table shows "sent as base64" next to such a field.
+- **Tokens that contain the user name** stay linked to the response that issued them, instead of being rebuilt from the users-file value.
+
+#### Sessions, cookies and logout
+Many applications keep the login in a cookie (ASP.NET forms authentication, for example). While that cookie is valid the server treats every request as the same user, and it may ignore a second login. Each virtual user has its own cookies, so users never share a session. What matters is what happens when a user's session should end:
+
+- **Default:** a user logs in once (the setup steps) and keeps that session for all of their iterations.
+- **Teardown (logout).** The workflow has a third list of steps, run when a user's session ends: after their last iteration, and before the next login when a new session starts. A logout at the end of your recording is moved there automatically (`/logout`, `/Account/LogOff`, `/signout`, ...). You can also move a step there, or add one, on the Workflow tab. A failed logout does not stop the other teardown steps. A run you stop does not send them; the natural end of a timed run does.
+- **Log in again every iteration** (Load & criteria → *Sessions and logout*, or `lt run --fresh-session`): every iteration starts a clean session, with cookies and saved values cleared, and the same user logs in again. The logout runs first, so sessions do not pile up on the server.
+- **New user every iteration** (users mode): every iteration logs in as the next user of the file, in a clean session, after logging the previous one out. This is how to cycle through many CSV users with a few virtual users.
+
+Without a logout step every new session stays open on the server, and the settings page warns you.
+
+#### Encoding and decoding values
+A value is written as `${name|filter}`, and filters can be chained: `${user.name|base64|urlencode}`. Choose one without typing: on any field, open the **`{ }`** menu and pick **Send it as**.
+
+| Filter | What it does |
+| --- | --- |
+| `base64` | UTF-8 text as Base64. What C# reads with `Convert.FromBase64String` and `Encoding.UTF8.GetString`. Non-ASCII names work. |
+| `base64url` | Base64 with `-` and `_`, no padding (JWT style) |
+| `base64utf16` | Base64 of UTF-16 text, as `Convert.ToBase64String(Encoding.Unicode.GetBytes(x))` makes |
+| `hex` | the UTF-8 bytes as hex |
+| `md5` `sha1` `sha256` `sha512` | hash as lower-case hex (add `\|upper` for capitals) |
+| `urlencode` `json` | escape for a URL / form value, or for a JSON string |
+| `base64decode` `base64utf16decode` `hexdecode` `urldecode` | read an encoded value |
+| `lower` `upper` `trim` | text tidying |
+
+When the server sends a value back encoded, decode it before later steps use it: on a saved value choose **then → Base64 decode** (or set `"transform": "base64decode"` on the extractor). A value that cannot be decoded fails that step with a clear message, for example `base64decode: "@@@" is not valid Base64`. The picker adds `|urlencode` or `|json` itself where the place needs it, and leaves it out when the encoding is already safe there (Base64 in a JSON string, hex in a URL).
+
+Encryption with a key or a salt cannot be recognised or repeated automatically. If a typed value appears in no request, not even encoded, the Data flow panel says so.
+
+#### Dynamic and conditional values
+A recorded click on "the 2nd item" becomes `$.items[1].id`, which is the same position for every user. That is often wrong: other users have other lists. Use **Make dynamic…** (on the Data flow warning, or **Which item…** on a saved value) to choose:
+- the same position, the first item, the last item or a random item
+- the first item **that matches a condition**, for example status is OPEN and qty is greater than 0. The recorded item's own fields are offered as ready-made conditions, and the dialog shows what the choice would pick from the recorded response.
+- a fallback value to use when nothing matches, instead of failing the step
+
+The same can be written by hand in a JSON path: `$.items[*].id`, `$.items[?(@.status=='OPEN')].id`, `$.items[?(@.qty>0 && @.type=='A')].id`. Conditions compare with `==  !=  >  >=  <  <=  =~` (regex), and `select` chooses `first`, `last` or `random` when several items match. On the command line `lt build` reports the same findings.
+
 #### Use data from another step
 Every value field in a step has a **`{ }`** button. It lists what is available at that point: values saved by earlier steps, users-file columns (`user.<column>`), workflow variables and generators (`$uuid`, `$timestamp`, `$randomInt(1,100)`, `$iteration`). *From an earlier step's response…* opens the recorded response of any earlier step. Click a JSON field, header, cookie or hidden page field and it becomes a saved variable and is inserted for you. This works for the URL, **query parameters**, **JSON and form body fields**, headers and authentication. Picking a value in a table row binds the whole field, and a bare number stays a number (`{"itemId":${itemId}}`). Steps that use a value nobody produces are flagged with a warning.
 
@@ -109,7 +159,7 @@ The **Authentication** panel adds credentials to every request: a bearer token, 
 When the run finishes it gets a **PASSED / FAILED** verdict and becomes a permanent report with **HTML**, **JUnit XML** and **JSON** downloads. **Run history** lists every run across all tests.
 
 #### Call details: check every request and response
-Counting millions of requests is cheap, but keeping every request and response is not. So each run keeps the **full details of a few calls per step**: the first 3 successful and the first 5 failed ones by default. Change this under *Load & criteria → Call details in reports*, or on the command line with `--samples`, `--error-samples` and `--body-kb`.
+Every run keeps **every request and response in full**, by default: what was sent, what came back, and what was saved for later steps. Keeping them costs almost no throughput and a few KB of memory per call. A safety limit of 100,000 kept calls per run (adjustable up to 1,000,000) protects memory and disk. Every request is still counted in the numbers after the limit is reached, and the run page tells you how many calls were kept. For very long or very busy runs, choose **A few per step** under *Load & criteria → Call details in reports* (or `lt run --samples 3 --error-samples 5`) to keep only the first few calls of every step.
 
 For each kept call the run page, the HTML report and the JSON report show:
 - the request: method, final URL, **headers** (including the cookies the session sent and the authentication), and **body**
@@ -119,7 +169,14 @@ For each kept call the run page, the HTML report and the JSON report show:
 
 A call that failed before it was sent (for example a `${variable}` no earlier step provides) is kept too, with the unfilled request and the error. **Validate** shows the same details for every call it makes, and each call can be copied as a cURL command.
 
+**How they are stored.** Calls are stored one row each, so the run page pages through them (25 at a time, filtered to failed or successful) and the JSON report contains all of them. The HTML report shows the first few per step and says how many more there are, so the file stays a usable size. Settings saved by an older version that limited runs to 3 calls per step keep every call now; choose "A few per step" again if you want the limit.
+
 **Credentials are masked by default**: Authorization and Cookie headers, and password, secret and token fields in bodies and URLs. A short prefix stays visible so values can still be matched by eye. Untick *Mask credentials* to see real values, and share such reports with care. On the command line use `--no-mask`.
+
+#### Clearing data
+Each test has a **Data & cleanup** tab. It lists what is stored and how much space it takes, with separate delete buttons for the recording, the workflow, the users file, the request and response details of the runs, and the run results. **Clear all data, keep the test** empties the test but keeps its name and settings. **Delete the whole test** removes everything. Nothing is deleted while a run or recording is in progress.
+
+On **Run history** and a test's run list, tick runs to **Delete selected** or **Delete call details** (the runs and their numbers stay), or use **Delete all finished**. A run's own page has **Delete call details** and **Delete**. Over the API: `POST /api/tests/:id/clear`, `POST /api/runs/delete`, `DELETE /api/runs/:id/calls`.
 
 ---
 
@@ -197,6 +254,7 @@ Security:
 | `LT_EMBEDDED_WORKER_CONCURRENCY` | `1000` memory / `100` distributed | max VUs generated by the app process |
 | `LT_CONCURRENCY` | `200` | max VUs per standalone worker |
 | `LT_RECORDER_ENABLED` / `LT_RECORDER_HEADLESS` | `true` / `false` | live browser recording |
+| `LT_RECORDER_BROWSER` | `chrome` | browser that opens for recording: `chrome` (installed Google Chrome), `msedge`, or `chromium` (Playwright bundled, needs `npx playwright install chromium`) |
 | `LT_REDIS_RUN_TTL_SEC` | `86400` | how long raw run data stays in Redis/memory after results are saved |
 | `LT_MAX_UPLOAD_MB` | `50` | max users/HAR upload size |
 | `LT_JOB_QUEUE` | `lt.vu.jobs` | RabbitMQ queue name |

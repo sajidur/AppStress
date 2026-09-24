@@ -1,6 +1,6 @@
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../../api';
-import { RunsTable } from '../../components/RunsTable';
+import { RunsManager } from '../../components/RunsManager';
 import { Card, Empty, ErrorBox, fmt, Loading, useAction } from '../../components/ui';
 import { useAsync } from '../../hooks';
 import { describe } from '../../thresholds';
@@ -82,7 +82,7 @@ export function RunsTab({ test }: TabProps) {
         ) : runs.loading && !runs.data ? (
           <Loading />
         ) : runs.data && runs.data.length ? (
-          <RunsTable runs={runs.data} />
+          <RunsManager runs={runs.data} reload={runs.reload} />
         ) : (
           <Empty title="No runs yet">Start the first run above.</Empty>
         )}

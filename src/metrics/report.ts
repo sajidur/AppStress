@@ -9,6 +9,8 @@ export interface ReportExtras {
   thresholds?: ThresholdResult[];
   /** calls kept with full request/response details */
   samples?: CallSample[];
+  /** how many calls were kept in total (the HTML shows only the first few per step) */
+  keptTotal?: number;
   capture?: CaptureSettings;
 }
 
@@ -204,7 +206,7 @@ function callHtml(c: CallSample): string {
     : '';
   return `<details class="${bad ? 'err' : 'okc'}"${bad ? ' open' : ''}><summary>
 <span class="st ${bad ? 'e' : 'g'}">${res ? res.status : 'no response'}</span><span>${ms(c.durationMs)}</span>
-<span class="muted">${c.phase === 'setup' ? 'setup' : `iteration ${c.iteration + 1}`} · virtual user ${c.vu + 1} · ${esc(when)}</span>${auth}
+<span class="muted">${c.phase === 'setup' ? 'setup' : c.phase === 'teardown' ? 'teardown' : `iteration ${c.iteration + 1}`} · virtual user ${c.vu + 1} · ${esc(when)}</span>${auth}
 ${c.error ? `<span class="bad">${esc(c.error)}</span>` : ''}</summary>
 <div class="cols"><div><h4>Request</h4><pre>${esc(`${req.method} ${req.url}`)}</pre>
 <h4>Request headers</h4><pre>${esc(headerLines(req.headers)) || none}</pre>
@@ -219,16 +221,17 @@ ${c.error ? `<span class="bad">${esc(c.error)}</span>` : ''}</summary>
 function callsHtml(s: RunStats, workflow: Workflow | undefined, x: ReportExtras): string {
   const samples = x.samples ?? [];
   if (!samples.length) {
-    const off = x.capture && x.capture.okSamples + x.capture.errorSamples === 0;
+    const off = x.capture && !x.capture.keepAll && x.capture.okSamples + x.capture.errorSamples === 0;
     return `<h2>Call details</h2><p class="muted">No call details were kept for this run${off ? ' (call capture was switched off in the test settings)' : ''}.</p>`;
   }
-  const steps = [...(workflow?.setup ?? []), ...(workflow?.steps ?? [])];
+  const steps = [...(workflow?.setup ?? []), ...(workflow?.steps ?? []), ...(workflow?.teardown ?? [])];
   const order = new Map(steps.map((st, i) => [st.name, i]));
   const names = [...new Set(samples.map((c) => c.step))].sort((a, b) => (order.get(a) ?? 1e9) - (order.get(b) ?? 1e9));
   const stat = new Map(s.steps.map((r) => [r.name, r]));
   const cap = x.capture;
   const masked = samples.some((c) => c.masked);
-  const kept = cap ? `${cap.okSamples} successful and ${cap.errorSamples} failed calls` : 'calls';
+  const kept = cap?.keepAll ? 'calls' : cap ? `${cap.okSamples} successful and ${cap.errorSamples} failed calls` : 'calls';
+  const partial = x.keptTotal !== undefined && x.keptTotal > samples.length ? ` This page shows ${samples.length} of the ${x.keptTotal} calls that were kept (the first few of every step); the JSON report and the run page have all of them.` : '';
   const maskNote = masked ? ' Credentials (Authorization and Cookie headers, password and token fields) are masked; switch this off in the test settings to see them.' : '';
   const sections = names
     .map((name) => {
@@ -242,6 +245,6 @@ function callsHtml(s: RunStats, workflow: Workflow | undefined, x: ReportExtras)
     })
     .join('');
   return `<h2>Call details</h2><div class="calls">
-<p class="muted">The numbers above count every request. For each step, the report keeps the first ${kept} in full: what was sent, what came back and what was saved for later steps. Failed calls are opened.${maskNote}</p>
+<p class="muted">The numbers above count every request. For each step, the report keeps the first ${kept} in full: what was sent, what came back and what was saved for later steps. Failed calls are opened.${partial}${maskNote}</p>
 ${sections}</div>`;
 }

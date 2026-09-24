@@ -3,7 +3,7 @@ import type { Backend, StateBackend } from '../backend/types.js';
 import { config } from '../config.js';
 import { printSummary, writeReports } from '../metrics/report.js';
 import type { RunStats } from '../metrics/stats.js';
-import { DEFAULT_CAPTURE, type CallSample, type CaptureSettings, type RunConfig, UsersMode, VuJob, Workflow } from '../types.js';
+import { normalizeCapture, type CallSample, type CaptureSettings, type RunConfig, UsersMode, VuJob, Workflow } from '../types.js';
 import { log, sleep } from '../util.js';
 
 export type { WorkerInfo } from '../backend/types.js';
@@ -18,6 +18,8 @@ export interface LaunchOptions {
   usersMode: UsersMode;
   thinkTimeScale: number;
   requestTimeoutMs: number;
+  /** log in again with a clean session at the start of every iteration */
+  freshSession?: boolean;
   /** how many calls per step keep full request/response details (default: DEFAULT_CAPTURE) */
   capture?: CaptureSettings;
   runId?: string;
@@ -49,7 +51,7 @@ export function validateLaunch(o: LaunchOptions): void {
   };
   if (!(o.vus >= 1)) fail('At least 1 virtual user is required');
   if (!o.durationSec && !o.iterations) fail('Specify a duration and/or iterations');
-  if (!o.workflow.steps.length && !o.workflow.setup.length) fail('The workflow has no steps');
+  if (!o.workflow.steps.length && !o.workflow.setup.length && !o.workflow.teardown?.length) fail('The workflow has no steps');
   if (o.usersMode === 'unique' && o.users.length < o.vus) {
     fail(`Users mode "unique" needs at least ${o.vus} users, but the users file has ${o.users.length}`);
   }
@@ -74,7 +76,8 @@ export async function launchRun(backend: Backend, o: LaunchOptions): Promise<Run
     usersCount: o.users.length,
     thinkTimeScale: o.thinkTimeScale,
     requestTimeoutMs: o.requestTimeoutMs,
-    capture: o.capture ?? DEFAULT_CAPTURE,
+    ...(o.freshSession ? { freshSession: true } : {}),
+    capture: normalizeCapture(o.capture),
     startAt,
     endAt,
     createdAt: Date.now(),
@@ -164,7 +167,7 @@ export async function runAndReport(backend: Backend, o: LaunchOptions & { report
   };
   process.on('SIGINT', onSigint);
 
-  const stepOrder = [...o.workflow.setup, ...o.workflow.steps].map((s) => s.name);
+  const stepOrder = [...o.workflow.setup, ...o.workflow.steps, ...(o.workflow.teardown ?? [])].map((s) => s.name);
   const { stats } = await monitorRun(backend.state, cfg, stepOrder, (p) => {
     const s = p.stats;
     const label = p.phase === 'starting' ? 'starting' : `t+${p.elapsedSec}s`;

@@ -5,7 +5,7 @@ import { applyAuth } from './auth.js';
 import { CookieJar } from './cookies.js';
 import { parseSetCookies, runExtractor, type ResponseView } from './extract.js';
 import { cut, maskHeaders, maskText, maskVars, type CallSampler } from './sampling.js';
-import { render, renderRecord, type Vars } from './template.js';
+import { applyFilters, render, renderRecord, type Vars } from './template.js';
 
 export const ITERATION_METRIC = '__iteration__';
 
@@ -46,6 +46,11 @@ export interface VirtualUserOptions {
   requestTimeoutMs: number;
   thinkTimeScale: number;
   shouldStop: () => boolean;
+  /**
+   * Cancels even the teardown (the run was stopped, the worker is shutting down). Defaults to shouldStop. The normal end
+   * of a timed run makes shouldStop true but must still let users log out.
+   */
+  shouldAbort?: () => boolean;
   /** keeps full request/response details for selected calls (reports); optional */
   sampler?: CallSampler;
   /** called after every step; used by `lt validate` */
@@ -69,6 +74,7 @@ export class VirtualUser {
   private vars: Vars = {};
   private phase: CallSample['phase'] = 'setup';
   private iteration = 0;
+  private user: Record<string, string> = {};
 
   constructor(private readonly o: VirtualUserOptions) {
     this.setUser(o.user);
@@ -76,9 +82,15 @@ export class VirtualUser {
 
   /** Swap the user (users-mode=per-iteration): fresh cookies and variables. */
   setUser(user: Record<string, string>): void {
+    this.user = user;
     this.jar.clear();
     this.vars = { ...this.o.workflow.variables, $vu: String(this.o.vuIndex) };
     for (const [k, v] of Object.entries(user)) this.vars[`user.${k}`] = v;
+  }
+
+  /** Start a new session for the same user: cookies and everything the steps saved are forgotten. */
+  resetSession(): void {
+    this.setUser(this.user);
   }
 
   runSetup(): Promise<boolean> {
@@ -98,17 +110,25 @@ export class VirtualUser {
     return ok;
   }
 
-  private async runSteps(steps: Step[]): Promise<boolean> {
+  /** Log out: the steps that end the session. Runs even when the run's time is up, but not when it was stopped. */
+  runTeardown(): Promise<boolean> {
+    this.phase = 'teardown';
+    return this.runSteps(this.o.workflow.teardown ?? [], true);
+  }
+
+  private async runSteps(steps: Step[], teardown = false): Promise<boolean> {
+    const stop = teardown ? (this.o.shouldAbort ?? this.o.shouldStop) : this.o.shouldStop;
     let allOk = true;
     for (const step of steps) {
-      if (this.o.shouldStop()) return false;
+      if (stop()) return false;
       const think = (step.thinkTimeMs ?? 0) * this.o.thinkTimeScale;
-      if (think > 0) await sleepInterruptible(think, this.o.shouldStop);
-      if (this.o.shouldStop()) return false;
+      if (think > 0) await sleepInterruptible(think, stop);
+      if (stop()) return false;
       const ok = await this.execStep(step);
       if (!ok) {
         allOk = false;
-        if (this.o.workflow.onError !== 'continue') return false;
+        // a failed logout call must not keep the other teardown steps from running
+        if (!teardown && this.o.workflow.onError !== 'continue') return false;
       }
     }
     return allOk;
@@ -135,7 +155,9 @@ export class VirtualUser {
 
     let url: string, method: string, headers: Record<string, string>, body: string | undefined;
     let authStatus: StepTrace['auth'];
+    const generated: Vars = {};
     try {
+      for (const [name, template] of Object.entries(step.set ?? {})) generated[name] = this.vars[name] = render(template, this.vars);
       method = step.request.method.toUpperCase();
       url = render(step.request.url, this.vars);
       headers = {
@@ -180,10 +202,26 @@ export class VirtualUser {
       error = `body does not contain "${step.expect.bodyContains}"`;
     }
 
-    const extracted: Vars = {};
+    const extracted: Vars = { ...generated };
     if (!error) {
       for (const ex of step.extract ?? []) {
-        const v = runExtractor(ex, res);
+        let v = runExtractor(ex, res);
+        if (v === undefined && ex.default !== undefined) {
+          try {
+            v = render(ex.default, this.vars);
+          } catch (e) {
+            error = `extract "${ex.var}": default value: ${errorMessage(e)}`;
+            break;
+          }
+        }
+        if (v !== undefined && ex.transform) {
+          try {
+            v = applyFilters(v, ex.transform);
+          } catch (e) {
+            error = `extract "${ex.var}": ${errorMessage(e)}`;
+            break;
+          }
+        }
         if (v === undefined) {
           if (!ex.optional) {
             error = `extract "${ex.var}" failed (${ex.from} ${ex.path ?? ex.name ?? ex.regex ?? ''})`;

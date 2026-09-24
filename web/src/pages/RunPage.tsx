@@ -6,7 +6,7 @@ import { TimeChart } from '../components/TimeChart';
 import { Card, ErrorBox, fmt, Loading, MethodTag, StatusBadge, useAction, VerdictBadge } from '../components/ui';
 import { useAsync, useEventStream } from '../hooks';
 import { describe, evaluate } from '../thresholds';
-import type { CallSample, RunDetails, RunProgress, RunRow, RunStats, RunStatus, StepStats } from '../types';
+import type { CallSample, RunDetails, RunProgress, RunRow, RunStats, RunStatus, StepRequest, StepStats } from '../types';
 
 type RunEvent = { type: 'status'; status: RunStatus } | { type: 'progress'; progress: RunProgress } | { type: 'finished'; run: RunRow };
 
@@ -24,8 +24,132 @@ function Kpi({ label, value, sub, tone }: { label: string; value: string; sub?: 
   );
 }
 
+/** One step's calls: the first few at a glance, or every kept call in pages with an outcome filter. */
+function StepCalls({
+  runId,
+  name,
+  def,
+  stat,
+  groups,
+  initial,
+}: {
+  runId: string;
+  name: string;
+  def?: StepRequest;
+  stat?: StepStats;
+  groups: { step: string; outcome: 'ok' | 'error'; count: number }[];
+  initial: CallSample[];
+}) {
+  const okKept = groups.find((g) => g.step === name && g.outcome === 'ok')?.count ?? 0;
+  const failedKept = groups.find((g) => g.step === name && g.outcome === 'error')?.count ?? 0;
+  const total = okKept + failedKept;
+  const [paged, setPaged] = useState(false);
+  const [filter, setFilter] = useState<'' | 'ok' | 'error'>('');
+  const [list, setList] = useState<CallSample[]>([]);
+  const [count, setCount] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+
+  const load = async (outcome: '' | 'ok' | 'error', offset: number) => {
+    setLoading(true);
+    setProblem(null);
+    try {
+      const r = await api.runCalls(runId, { step: name, outcome: outcome || undefined, offset, limit: 25 });
+      setList((l) => (offset ? [...l, ...r.calls] : r.calls));
+      setCount(r.total);
+    } catch (e) {
+      setProblem((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+  const browse = () => {
+    setPaged(true);
+    void load(filter, 0);
+  };
+  const changeFilter = (f: '' | 'ok' | 'error') => {
+    setFilter(f);
+    void load(f, 0);
+  };
+
+  const defText = def
+    ? [`${def.method} ${def.url}`, ...Object.entries(def.headers ?? {}).map(([k, v]) => `${k}: ${v}`), ...(def.body !== undefined ? ['', def.body] : [])].join('\n')
+    : '';
+  const glance = [...initial].sort((a, b) => Number(b.outcome === 'error') - Number(a.outcome === 'error') || a.at - b.at);
+
+  return (
+    <details className="call-step" open={failedKept > 0}>
+      <summary>
+        <MethodTag method={def?.method ?? initial[0]?.request.method ?? 'GET'} />
+        <span className="mono call-step-name" title={name}>
+          {name}
+        </span>
+        {stat && (
+          <span className="faint">
+            {fmt.num(stat.count)} calls · {fmt.num(stat.errors)} failed · avg {fmt.ms(stat.avgMs)}
+          </span>
+        )}
+        <span className="chip">{fmt.num(okKept)} ok kept</span>
+        {failedKept > 0 && <span className="badge bad">{fmt.num(failedKept)} failed kept</span>}
+      </summary>
+      <div className="stack" style={{ gap: 8, padding: '10px 12px' }}>
+        {def && (
+          <details className="call-def">
+            <summary>Configured request (variables not yet filled in)</summary>
+            <pre className="call-pre">{defText}</pre>
+          </details>
+        )}
+        {paged ? (
+          <>
+            <div className="row" style={{ gap: 10 }}>
+              <label className="row" style={{ gap: 6 }}>
+                <span className="muted">Show</span>
+                <select aria-label="Which calls to show" value={filter} onChange={(e) => changeFilter(e.target.value as typeof filter)} style={{ width: 170 }}>
+                  <option value="">all kept calls</option>
+                  <option value="error">only failed calls</option>
+                  <option value="ok">only successful calls</option>
+                </select>
+              </label>
+              <span className="muted">
+                {fmt.num(list.length)} of {fmt.num(count)}
+              </span>
+              <button className="btn small ghost" onClick={() => setPaged(false)}>
+                Back to the first few
+              </button>
+            </div>
+            {problem && <div className="callout bad">{problem}</div>}
+            <CallList calls={list} empty={loading ? <Loading what="Loading calls" /> : <div className="faint">No calls match.</div>} />
+            {list.length < count && (
+              <div>
+                <button className="btn small" onClick={() => void load(filter, list.length)} disabled={loading}>
+                  {loading ? 'Loading…' : `Load ${Math.min(25, count - list.length)} more`}
+                </button>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <CallList calls={glance} />
+            {total > initial.length && (
+              <div className="row">
+                <span className="muted">
+                  Showing {fmt.num(initial.length)} of {fmt.num(total)} kept calls.
+                </span>
+                <button className="btn small" onClick={browse}>
+                  Browse all {fmt.num(total)}
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </details>
+  );
+}
+
 /** Full request/response details of the calls kept for each step. */
 function CallDetails({ runId, status, stats }: { runId: string; status: RunStatus; stats: RunStats }) {
+  const { busy, run } = useAction();
   const calls = useAsync(() => api.runSamples(runId), [runId, status]);
   const d = calls.data;
   const byStep = useMemo(() => {
@@ -33,24 +157,38 @@ function CallDetails({ runId, status, stats }: { runId: string; status: RunStatu
     for (const s of d?.samples ?? []) m.set(s.step, [...(m.get(s.step) ?? []), s]);
     return m;
   }, [d]);
-  const names = [...new Set([...(d?.steps.map((s) => s.name) ?? []), ...stats.steps.map((s) => s.name), ...byStep.keys()])].filter((n) => byStep.has(n));
+  const keptStep = (n: string) => (d?.groups ?? []).some((g) => g.step === n);
+  const names = [...new Set([...(d?.steps.map((s) => s.name) ?? []), ...stats.steps.map((s) => s.name), ...byStep.keys()])].filter(keptStep);
   const cap = d?.capture;
-  const statOf = (name: string) => stats.steps.find((s) => s.name === name);
-  const defOf = (name: string) => d?.steps.find((s) => s.name === name)?.request;
+  const keptTotal = (d?.groups ?? []).reduce((n, g) => n + g.count, 0);
+  const off = cap && !cap.keepAll && cap.okSamples + cap.errorSamples === 0;
+  const running = status === 'starting' || status === 'running' || status === 'stopping';
   const hint = cap
-    ? `The numbers above count every request. For each step the run keeps the first ${cap.okSamples} successful and ${cap.errorSamples} failed calls in full: what was sent, what came back and what was saved. ${cap.maskSecrets ? 'Credentials are masked.' : 'Credentials are shown.'}`
+    ? cap.keepAll
+      ? `Every call is kept in full, up to ${fmt.num(cap.maxCalls ?? 100_000)} per run: what was sent, what came back and what was saved. ${cap.maskSecrets ? 'Credentials are masked.' : 'Credentials are shown.'}`
+      : `The numbers above count every request. For each step the run keeps the first ${cap.okSamples} successful and ${cap.errorSamples} failed calls in full. ${cap.maskSecrets ? 'Credentials are masked.' : 'Credentials are shown.'}`
     : 'Full request and response of the calls kept for each step.';
-  const off = cap && cap.okSamples + cap.errorSamples === 0;
-  const running = status === 'starting' || status === 'running';
+  const removeAll = async () => {
+    if (!confirm(`Delete the stored request and response details of this run (${fmt.num(keptTotal)} calls)? The run and its statistics stay.`)) return;
+    const r = await run(() => api.deleteRunCalls(runId), 'Call details deleted');
+    if (r) await calls.reload();
+  };
 
   return (
     <Card
       title="Call details"
       hint={hint}
       actions={
-        <button className="btn small" onClick={() => void calls.reload()} disabled={calls.loading}>
-          Refresh
-        </button>
+        <>
+          <button className="btn small" onClick={() => void calls.reload()} disabled={calls.loading}>
+            Refresh
+          </button>
+          {!running && keptTotal > 0 && (
+            <button className="btn small danger" onClick={removeAll} disabled={busy}>
+              Delete call details
+            </button>
+          )}
+        </>
       }
     >
       {calls.error ? (
@@ -63,45 +201,26 @@ function CallDetails({ runId, status, stats }: { runId: string; status: RunStatu
             ? 'Call capture was switched off for this run (Load & criteria → Call details).'
             : running
               ? 'No calls kept yet. They appear here as the run makes requests.'
-              : 'No call details were kept for this run. Runs started before this feature existed have none.'}
+              : 'No call details are stored for this run. They were deleted, never kept, or the run started before this feature existed.'}
         </div>
       ) : (
         <div className="stack" style={{ gap: 10 }}>
-          {names.map((name) => {
-            const list = byStep.get(name)!;
-            const st = statOf(name);
-            const def = defOf(name);
-            const failed = list.filter((c) => c.outcome === 'error').length;
-            const defText = def
-              ? [`${def.method} ${def.url}`, ...Object.entries(def.headers ?? {}).map(([k, v]) => `${k}: ${v}`), ...(def.body !== undefined ? ['', def.body] : [])].join('\n')
-              : '';
-            return (
-              <details key={name} className="call-step" open={failed > 0}>
-                <summary>
-                  <MethodTag method={def?.method ?? list[0].request.method} />
-                  <span className="mono call-step-name" title={name}>
-                    {name}
-                  </span>
-                  {st && (
-                    <span className="faint">
-                      {fmt.num(st.count)} calls · {fmt.num(st.errors)} failed · avg {fmt.ms(st.avgMs)}
-                    </span>
-                  )}
-                  <span className="chip">{list.length - failed} ok kept</span>
-                  {failed > 0 && <span className="badge bad">{failed} failed kept</span>}
-                </summary>
-                <div className="stack" style={{ gap: 8, padding: '10px 12px' }}>
-                  {def && (
-                    <details className="call-def">
-                      <summary>Configured request (variables not yet filled in)</summary>
-                      <pre className="call-pre">{defText}</pre>
-                    </details>
-                  )}
-                  <CallList calls={[...list].sort((a, b) => Number(b.outcome === 'error') - Number(a.outcome === 'error') || a.at - b.at)} />
-                </div>
-              </details>
-            );
-          })}
+          {cap?.keepAll && !running && keptTotal < stats.total.count && (
+            <div className="callout warn">
+              Details were kept for {fmt.num(keptTotal)} of the {fmt.num(stats.total.count)} requests: the limit of {fmt.num(cap.maxCalls ?? 100_000)} kept calls (or the memory budget) was reached, so later calls are counted but not kept. Raise the limit under Load &amp; criteria → Call details in reports.
+            </div>
+          )}
+          {names.map((name) => (
+            <StepCalls
+              key={name}
+              runId={runId}
+              name={name}
+              def={d.steps.find((s) => s.name === name)?.request}
+              stat={stats.steps.find((s) => s.name === name)}
+              groups={d.groups}
+              initial={byStep.get(name) ?? []}
+            />
+          ))}
         </div>
       )}
     </Card>
@@ -206,8 +325,8 @@ export function RunPage() {
   };
   const remove = async () => {
     if (!confirm('Delete this run and its results?')) return;
-    const ok = await run(() => api.deleteRun(id), 'Run deleted');
-    if (ok !== undefined) nav(`/tests/${r.testId}/runs`);
+    const ok = await run(async () => (await api.deleteRun(id), true), 'Run deleted');
+    if (ok) nav(`/tests/${r.testId}/runs`);
   };
 
   return (

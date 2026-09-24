@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseFilterChain } from '../engine/filter-names.js';
 
 const url = z
   .string()
@@ -26,12 +27,15 @@ export const settingsSchema = z
     baseUrl: z.union([url, z.literal('')]).optional(),
     variables: z.record(z.string().regex(/^[A-Za-z_][\w.]*$/, 'Invalid variable name'), z.string()).default({}),
     thresholds: z.array(thresholdSchema).max(50).default([]),
+    freshSession: z.boolean().optional(),
     capture: z
       .object({
         okSamples: z.number().int().min(0).max(50),
         errorSamples: z.number().int().min(0).max(200),
         bodyKb: z.number().int().min(1).max(512),
         maskSecrets: z.boolean(),
+        keepAll: z.boolean().optional(),
+        maxCalls: z.number().int().min(1).max(1_000_000).optional(),
       })
       .optional(),
   })
@@ -59,6 +63,8 @@ export const buildOptionsSchema = z.object({
   correlate: z.boolean().default(true),
   cacheLoginTtlSec: z.number().int().min(1).optional(),
   keepTracking: z.boolean().default(false),
+  /** typed input (by position in the recording) -> users-file column; the server fills in the typed value */
+  typedMap: z.record(z.string(), z.string().min(1)).optional(),
 });
 
 const extractorSchema = z.object({
@@ -69,6 +75,12 @@ const extractorSchema = z.object({
   regex: z.string().optional(),
   group: z.number().int().min(0).optional(),
   optional: z.boolean().optional(),
+  select: z.enum(['first', 'last', 'random']).optional(),
+  default: z.string().optional(),
+  transform: z
+    .string()
+    .optional()
+    .refine((t) => parseFilterChain(t).unknown.length === 0, (t) => ({ message: `Unknown transform "${parseFilterChain(t).unknown.join(', ')}"` })),
 });
 
 const stepSchema = z.object({
@@ -77,6 +89,7 @@ const stepSchema = z.object({
   resourceType: z.string().optional(),
   sourceId: z.number().int().optional(),
   skipAuth: z.boolean().optional(),
+  set: z.record(z.string().regex(/^[A-Za-z_][\w.]*$/, 'Invalid variable name'), z.string()).optional(),
   request: z.object({
     method: z.string().regex(/^[A-Za-z]+$/),
     url: z.string().min(1),
@@ -121,15 +134,16 @@ export const workflowSchema = z
     auth: authSchema.optional(),
     setup: z.array(stepSchema),
     steps: z.array(stepSchema),
+    teardown: z.array(stepSchema).optional(),
     onError: z.enum(['abortIteration', 'continue']).optional(),
   })
   .superRefine((wf, ctx) => {
     const seen = new Set<string>();
-    for (const s of [...wf.setup, ...wf.steps]) {
+    for (const s of [...wf.setup, ...wf.steps, ...(wf.teardown ?? [])]) {
       if (seen.has(s.name)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Duplicate step name "${s.name}"` });
       seen.add(s.name);
     }
-    for (const s of [...wf.setup, ...wf.steps]) {
+    for (const s of [...wf.setup, ...wf.steps, ...(wf.teardown ?? [])]) {
       for (const e of s.extract ?? []) {
         if (e.from === 'body' && !e.path) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${s.name}: extractor "${e.var}" needs a JSON path` });
         if ((e.from === 'header' || e.from === 'cookie') && !e.name) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${s.name}: extractor "${e.var}" needs a name` });
@@ -160,6 +174,27 @@ export const validateSchema = z.object({
   userIndex: z.number().int().min(0).default(0),
   iterations: z.number().int().min(1).max(5).default(1),
 });
+
+export const deleteRunsSchema = z
+  .object({
+    ids: z.array(z.string().min(1)).max(1000).optional(),
+    all: z.boolean().optional(),
+    /** only remove the stored request/response details; the runs and their statistics stay */
+    only: z.enum(['calls']).optional(),
+  })
+  .refine((b) => (b.ids?.length ?? 0) > 0 || b.all === true, 'Give the run ids to delete, or all: true');
+
+export const clearTestSchema = z
+  .object({
+    recording: z.boolean(),
+    workflow: z.boolean(),
+    users: z.boolean(),
+    /** every finished run of the test, with its calls */
+    runs: z.boolean(),
+    /** only the stored request/response details of the test's runs */
+    calls: z.boolean(),
+  })
+  .partial();
 
 export const startRunSchema = z.object({
   triggeredBy: z.string().max(100).default('ui'),

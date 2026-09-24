@@ -19,6 +19,8 @@ export interface BuildOptionsInput {
   correlate: boolean;
   cacheLoginTtlSec?: number;
   keepTracking?: boolean;
+  /** typed input (by position in the recording) -> users-file column */
+  typedMap?: Record<string, string>;
 }
 
 export interface TestRow {
@@ -124,6 +126,19 @@ const MIGRATIONS: string[] = [
    CREATE INDEX runs_by_status ON runs(status);`,
   // full request/response details of sampled calls (JSON array of CallSample)
   `ALTER TABLE runs ADD COLUMN samples TEXT;`,
+  // one row per kept call: runs can keep every call, so they cannot live in one JSON value
+  `CREATE TABLE calls (
+     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+     seq INTEGER NOT NULL,
+     step TEXT NOT NULL,
+     outcome TEXT NOT NULL,
+     status INTEGER,
+     at INTEGER NOT NULL,
+     duration_ms REAL NOT NULL,
+     data TEXT NOT NULL,
+     PRIMARY KEY (run_id, seq)
+   );
+   CREATE INDEX calls_by_step ON calls(run_id, step, outcome);`,
 ];
 
 const json = <T>(v: unknown): T | null => (v === null || v === undefined ? null : (JSON.parse(String(v)) as T));
@@ -197,7 +212,7 @@ export class Store {
         startUrl: t.startUrl,
         updatedAt: t.updatedAt,
         hasWorkflow: !!t.workflow,
-        stepCount: t.workflow ? t.workflow.setup.length + t.workflow.steps.length : 0,
+        stepCount: t.workflow ? t.workflow.setup.length + t.workflow.steps.length + (t.workflow.teardown?.length ?? 0) : 0,
         users: r.users === null ? 0 : Number(r.users),
         recordedRequests: r.recorded === null ? 0 : Number(r.recorded),
         runCount: Number(r.run_count),
@@ -372,10 +387,142 @@ export class Store {
     return r ? { stats: json<RunStats>(r.stats), workflow: json<Workflow>(r.workflow)! } : null;
   }
 
-  /** Calls kept with full request/response details, or [] when the run has none. */
-  getRunSamples(id: string): CallSample[] {
-    const r = this.db.prepare('SELECT samples FROM runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-    return json<CallSample[]>(r?.samples) ?? [];
+  /** Store every kept call of a run (replacing earlier ones), one row per call so runs with many calls stay queryable. */
+  saveRunCalls(runId: string, calls: CallSample[]): void {
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare('DELETE FROM calls WHERE run_id = ?').run(runId);
+      const insert = this.db.prepare('INSERT INTO calls (run_id, seq, step, outcome, status, at, duration_ms, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+      calls.forEach((c, i) => insert.run(runId, i, c.step, c.outcome, c.response?.status ?? null, c.at, c.durationMs, JSON.stringify(c)));
+      this.db.exec('COMMIT');
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  /**
+   * Calls kept with full request/response details. `perGroup` limits how many are returned for every
+   * step and outcome (for reports); without it all are returned.
+   */
+  getRunSamples(id: string, perGroup?: number): CallSample[] {
+    const rows =
+      perGroup === undefined
+        ? (this.db.prepare('SELECT data FROM calls WHERE run_id = ? ORDER BY seq').all(id) as Record<string, unknown>[])
+        : (this.db
+            .prepare(
+              `WITH ranked AS (SELECT data, seq, ROW_NUMBER() OVER (PARTITION BY step, outcome ORDER BY seq) AS rn FROM calls WHERE run_id = ?)
+               SELECT data FROM ranked WHERE rn <= ? ORDER BY seq`,
+            )
+            .all(id, perGroup) as Record<string, unknown>[]);
+    if (rows.length) return rows.map((r) => JSON.parse(String(r.data)) as CallSample);
+    // runs saved before calls had their own table
+    const legacy = json<CallSample[]>((this.db.prepare('SELECT samples FROM runs WHERE id = ?').get(id) as Record<string, unknown> | undefined)?.samples) ?? [];
+    if (perGroup === undefined) return legacy;
+    const seen = new Map<string, number>();
+    return legacy.filter((c) => {
+      const k = `${c.step}|${c.outcome}`;
+      seen.set(k, (seen.get(k) ?? 0) + 1);
+      return seen.get(k)! <= perGroup;
+    });
+  }
+
+  /** How many calls were kept for each step, split by outcome. */
+  runCallGroups(id: string): { step: string; outcome: 'ok' | 'error'; count: number }[] {
+    const rows = this.db.prepare('SELECT step, outcome, COUNT(*) AS n FROM calls WHERE run_id = ? GROUP BY step, outcome ORDER BY MIN(seq)').all(id) as Record<string, unknown>[];
+    if (rows.length) return rows.map((r) => ({ step: String(r.step), outcome: r.outcome as 'ok' | 'error', count: Number(r.n) }));
+    const groups = new Map<string, { step: string; outcome: 'ok' | 'error'; count: number }>();
+    for (const c of this.getRunSamples(id)) {
+      const g = groups.get(`${c.step}|${c.outcome}`) ?? { step: c.step, outcome: c.outcome, count: 0 };
+      g.count++;
+      groups.set(`${c.step}|${c.outcome}`, g);
+    }
+    return [...groups.values()];
+  }
+
+  /** A page of the kept calls, optionally of one step / outcome / status. */
+  getRunCalls(id: string, f: { step?: string; outcome?: 'ok' | 'error'; status?: number; limit: number; offset: number }): { total: number; calls: CallSample[] } {
+    const where = ['run_id = ?'];
+    const values: (string | number)[] = [id];
+    if (f.step) (where.push('step = ?'), values.push(f.step));
+    if (f.outcome) (where.push('outcome = ?'), values.push(f.outcome));
+    if (f.status !== undefined) (where.push('status = ?'), values.push(f.status));
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS n FROM calls WHERE ${where.join(' AND ')}`).get(...values) as Record<string, unknown>).n);
+    if (total === 0) {
+      const legacy = this.getRunSamples(id).filter((c) => (!f.step || c.step === f.step) && (!f.outcome || c.outcome === f.outcome) && (f.status === undefined || c.response?.status === f.status));
+      return { total: legacy.length, calls: legacy.slice(f.offset, f.offset + f.limit) };
+    }
+    const rows = this.db.prepare(`SELECT data FROM calls WHERE ${where.join(' AND ')} ORDER BY seq LIMIT ? OFFSET ?`).all(...values, f.limit, f.offset) as Record<string, unknown>[];
+    return { total, calls: rows.map((r) => JSON.parse(String(r.data)) as CallSample) };
+  }
+
+  /** Remove the stored request/response details of a run; its statistics stay. Returns how many calls were removed. */
+  deleteRunCalls(id: string): number {
+    const n = Number(this.db.prepare('DELETE FROM calls WHERE run_id = ?').run(id).changes);
+    const legacy = this.db.prepare('UPDATE runs SET samples = NULL WHERE id = ? AND samples IS NOT NULL').run(id);
+    return n + Number(legacy.changes);
+  }
+
+  /**
+   * Delete finished runs: the given ids, or every run of a test, or all runs. Runs that are still active are
+   * never deleted; they are counted as skipped.
+   */
+  deleteRuns(f: { ids?: string[]; testId?: string; all?: boolean }): { deleted: number; skipped: number } {
+    let rows: Record<string, unknown>[];
+    if (f.ids) {
+      rows = f.ids.length
+        ? (this.db.prepare(`SELECT id, status FROM runs WHERE id IN (${f.ids.map(() => '?').join(', ')})`).all(...f.ids) as Record<string, unknown>[])
+        : [];
+    } else if (f.testId) rows = this.db.prepare('SELECT id, status FROM runs WHERE test_id = ?').all(f.testId) as Record<string, unknown>[];
+    else if (f.all) rows = this.db.prepare('SELECT id, status FROM runs').all() as Record<string, unknown>[];
+    else return { deleted: 0, skipped: 0 };
+    const active = new Set<string>(ACTIVE_STATUSES);
+    const doomed = rows.filter((r) => !active.has(String(r.status))).map((r) => String(r.id));
+    this.db.exec('BEGIN');
+    try {
+      const del = this.db.prepare('DELETE FROM runs WHERE id = ?');
+      for (const id of doomed) del.run(id);
+      this.db.exec('COMMIT');
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+    return { deleted: doomed.length, skipped: rows.length - doomed.length };
+  }
+
+  deleteRecording(testId: string): boolean {
+    const removed = Number(this.db.prepare('DELETE FROM recordings WHERE test_id = ?').run(testId).changes) > 0;
+    if (removed) this.touchTest(testId);
+    return removed;
+  }
+
+  /** Forget the built workflow and its build report (the recording, users and settings stay). */
+  clearWorkflow(testId: string): void {
+    this.db.prepare('UPDATE tests SET workflow = NULL, build_report = NULL, updated_at = ? WHERE id = ?').run(Date.now(), testId);
+  }
+
+  /** What is stored for a test and roughly how much space it takes (bytes are the size of the stored text). */
+  testDataSummary(testId: string): {
+    recording: { exchanges: number; bytes: number } | null;
+    users: { rows: number; bytes: number } | null;
+    runs: { count: number; bytes: number; active: number };
+    calls: { count: number; bytes: number };
+  } {
+    const one = (sql: string, ...v: (string | number)[]) => this.db.prepare(sql).get(...v) as Record<string, unknown> | undefined;
+    const rec = one('SELECT exchange_count AS n, length(data) AS b FROM recordings WHERE test_id = ?', testId);
+    const ds = one('SELECT row_count AS n, length(rows) AS b FROM datasets WHERE test_id = ?', testId);
+    const runs = one(
+      `SELECT COUNT(*) AS n, COALESCE(SUM(COALESCE(length(stats), 0) + COALESCE(length(workflow), 0) + COALESCE(length(samples), 0)), 0) AS b,
+              COALESCE(SUM(CASE WHEN status IN ('starting', 'running', 'stopping') THEN 1 ELSE 0 END), 0) AS a FROM runs WHERE test_id = ?`,
+      testId,
+    )!;
+    const calls = one('SELECT COUNT(*) AS n, COALESCE(SUM(length(calls.data)), 0) AS b FROM calls JOIN runs ON runs.id = calls.run_id WHERE runs.test_id = ?', testId)!;
+    return {
+      recording: rec ? { exchanges: Number(rec.n), bytes: Number(rec.b) } : null,
+      users: ds ? { rows: Number(ds.n), bytes: Number(ds.b) } : null,
+      runs: { count: Number(runs.n), bytes: Number(runs.b), active: Number(runs.a) },
+      calls: { count: Number(calls.n), bytes: Number(calls.b) },
+    };
   }
 
   listRuns(filter: { testId?: string; limit?: number; statuses?: RunStatus[] } = {}): RunRow[] {
