@@ -48,7 +48,7 @@ export function conditionText(c: Condition): string {
   return `@.${field}${c.op}${value}`;
 }
 
-export type PickMode = 'position' | 'first' | 'last' | 'random' | 'where';
+export type PickMode = 'position' | 'first' | 'last' | 'random' | 'vu' | 'iteration' | 'sequence' | 'where' | 'all' | 'allField';
 
 export interface ListPick {
   mode: PickMode;
@@ -59,7 +59,7 @@ export interface ListPick {
 }
 
 /** The JSON path and selection that implement a pick. */
-export function applyListPick(p: ListPath, pick: ListPick): Pick<Extractor, 'path' | 'select'> {
+export function applyListPick(p: ListPath, pick: ListPick): Pick<Extractor, 'path' | 'select' | 'list'> {
   switch (pick.mode) {
     case 'position':
       return { path: `${p.prefix}[${p.index}]${p.suffix}`, select: undefined };
@@ -69,6 +69,18 @@ export function applyListPick(p: ListPath, pick: ListPick): Pick<Extractor, 'pat
       return { path: `${p.prefix}[*]${p.suffix}`, select: 'last' };
     case 'random':
       return { path: `${p.prefix}[*]${p.suffix}`, select: 'random' };
+    // a different item for every virtual user / for every iteration: how customers coming from an API are spread over the test
+    case 'vu':
+      return { path: `${p.prefix}[*]${p.suffix}`, select: 'vu' };
+    case 'iteration':
+      return { path: `${p.prefix}[*]${p.suffix}`, select: 'iteration' };
+    case 'sequence':
+      return { path: `${p.prefix}[*]${p.suffix}`, select: 'sequence' };
+    // every item, saved as a list that steps can be repeated over
+    case 'all':
+      return { path: `${p.prefix}[*]`, select: undefined, list: true };
+    case 'allField':
+      return { path: `${p.prefix}[*]${p.suffix}`, select: undefined, list: true };
     case 'where': {
       const conds = (pick.where ?? []).filter((c) => c.field.trim() !== '').map(conditionText);
       const filter = conds.length ? `[?(${conds.join(' && ')})]` : '[*]';
@@ -87,8 +99,11 @@ export function siblingFields(sample: { path: string; value: string }[], p: List
 }
 
 /** Describe an extractor's selection in words (for chips and hints). */
-export function describePick(e: Pick<Extractor, 'path' | 'select'>): string {
+export function describePick(e: Pick<Extractor, 'path' | 'select' | 'list'>): string {
   const path = e.path ?? '';
+  if (e.list) return 'every item, saved as a list';
+  const words: Record<string, string> = { vu: 'item for each virtual user', iteration: 'next item every iteration', sequence: 'item per user and iteration' };
+  if (e.select && words[e.select] && path.includes('[*]')) return words[e.select];
   const filter = /\[\?\((.*)\)\]/.exec(path);
   if (filter) return `${e.select ?? 'first'} item where ${filter[1].replace(/@\./g, '')}`;
   if (path.includes('[*]')) return `${e.select ?? 'first'} item`;

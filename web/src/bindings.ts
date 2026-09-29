@@ -13,7 +13,7 @@ export interface StepRef {
 export interface VarInfo {
   /** name as used in ${name} */
   name: string;
-  kind: 'step' | 'user' | 'variable' | 'builtin';
+  kind: 'step' | 'user' | 'variable' | 'builtin' | 'loop';
   /** where the value comes from, e.g. the step name */
   source: string;
   /** ready-to-insert placeholder text for kind=builtin (e.g. ${$randomInt(1,100)}) */
@@ -48,7 +48,7 @@ export function stepsBefore(wf: Workflow, ref: StepRef): { ref: StepRef; step: S
 }
 
 /** Variables a step can reference: values extracted by earlier steps, user columns, workflow variables and built-ins. */
-export function availableVars(wf: Workflow, ref: StepRef, userColumns: string[] = [], extraVars: string[] = []): VarInfo[] {
+export function availableVars(wf: Workflow, ref: StepRef, userColumns: string[] = [], extraVars: string[] = [], loopFields: string[] = []): VarInfo[] {
   const out: VarInfo[] = [];
   const seen = new Set<string>();
   const add = (v: VarInfo) => {
@@ -64,6 +64,14 @@ export function availableVars(wf: Workflow, ref: StepRef, userColumns: string[] 
   // variables a step generates for itself are available to its own request
   const own = stepsOf(wf, ref.phase)[ref.index];
   for (const name of Object.keys(own?.set ?? {})) add({ name, kind: 'step', source: 'made up by this step' });
+  // the item of the loop this step repeats
+  if (own?.each) {
+    const as = own.each.as;
+    add({ name: as, kind: 'loop', source: `each item of ${own.each.list}` });
+    for (const f of loopFields) add({ name: `${as}.${f}`, kind: 'loop', source: 'field of the item' });
+    add({ name: `${as}.$index`, kind: 'loop', source: 'position in the list (from 0)' });
+    add({ name: `${as}.$count`, kind: 'loop', source: 'number of items' });
+  }
   for (const c of userColumns) add({ name: `user.${c}`, kind: 'user', source: 'users file' });
   for (const name of [...Object.keys(wf.variables), ...extraVars]) add({ name, kind: 'variable', source: 'workflow variable' });
   for (const b of BUILTINS) add(b);
@@ -100,6 +108,8 @@ export function unresolvedVars(wf: Workflow, ref: StepRef, userColumns: string[]
   for (const t of stepTexts(step)) {
     for (const n of placeholdersIn(t)) {
       if (n.startsWith('$') || ok.has(n)) continue;
+      // fields of a loop item are only known from the recorded response: any field of the item is accepted
+      if (step.each && (n === step.each.as || n.startsWith(`${step.each.as}.`))) continue;
       // user.<column> is only checked when the users file is known
       if (n.startsWith('user.') && userColumns.length === 0) continue;
       missing.add(n);

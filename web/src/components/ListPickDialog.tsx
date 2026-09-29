@@ -11,7 +11,12 @@ const MODES: { id: PickMode; label: string; help: string }[] = [
   { id: 'first', label: 'The first item', help: 'Whatever is first in the list this user receives.' },
   { id: 'last', label: 'The last item', help: 'Whatever is last in the list this user receives.' },
   { id: 'random', label: 'A random item', help: 'A different item each time: spreads users across the data.' },
+  { id: 'vu', label: 'A different item for each virtual user', help: 'Virtual user 1 takes the 1st item, user 2 the 2nd, and so on (starting again when there are more users than items). Every iteration of a user keeps its item.' },
+  { id: 'iteration', label: 'The next item every iteration', help: 'Iteration 1 takes the 1st item, iteration 2 the 2nd, and so on. This is how one user works through the customers of a list.' },
+  { id: 'sequence', label: 'A different item for every user and iteration', help: 'Spreads users and iterations over the list together.' },
   { id: 'where', label: 'An item that matches a condition', help: 'For example the first item whose status is OPEN.' },
+  { id: 'all', label: 'Every item, to repeat steps for each', help: 'Saves the whole list. Then switch on "Repeat for each item" on the steps that should run once per customer.' },
+  { id: 'allField', label: 'Every value of this field, to repeat steps for each', help: 'Saves just this field of every item (for example all the ids) as a list.' },
 ];
 
 /**
@@ -28,7 +33,7 @@ export function ListPickDialog({
   testId: string;
   step: Step;
   extractor: Extractor;
-  onApply: (patch: Pick<Extractor, 'path' | 'select' | 'default'>) => void;
+  onApply: (patch: Pick<Extractor, 'path' | 'select' | 'default' | 'list'>) => void;
   onClose: () => void;
 }) {
   const parts = splitListPath(extractor.path ?? '');
@@ -45,7 +50,7 @@ export function ListPickDialog({
   const manual = !parts;
   const suggestions = useMemo(() => (parts && sample.data ? siblingFields(sample.data.jsonPaths, parts).slice(0, 12) : []), [parts, sample.data]);
 
-  const result: Pick<Extractor, 'path' | 'select'> = manual
+  const result: Pick<Extractor, 'path' | 'select' | 'list'> = manual
     ? { path: manualPath, select }
     : applyListPick(parts!, { mode, where, select } as ListPick);
 
@@ -63,7 +68,8 @@ export function ListPickDialog({
 
   const addCondition = (field = '', value = '') => setWhere([...where, { field, op: '==', value }]);
   const setCond = (i: number, patch: Partial<Condition>) => setWhere(where.map((c, j) => (j === i ? { ...c, ...patch } : c)));
-  const multi = manual ? existingMulti : mode !== 'position';
+  const wholeList = !manual && (mode === 'all' || mode === 'allField');
+  const multi = (manual ? existingMulti : mode !== 'position') && !wholeList;
 
   return (
     <Modal
@@ -75,7 +81,7 @@ export function ListPickDialog({
           <button className="btn" onClick={onClose}>
             Cancel
           </button>
-          <button className="btn primary" disabled={!result.path || preview?.count === -1} onClick={() => onApply({ path: result.path, select: multi ? result.select : undefined, default: fallback })}>
+          <button className="btn primary" disabled={!result.path || preview?.count === -1} onClick={() => onApply({ path: result.path, select: multi ? result.select : undefined, list: result.list, default: fallback })}>
             Use this
           </button>
         </>
@@ -91,7 +97,7 @@ export function ListPickDialog({
         </Field>
       ) : (
         <div className="stack" style={{ gap: 6 }}>
-          {MODES.map((m) => (
+          {MODES.filter((m) => m.id !== 'allField' || !!parts?.suffix).map((m) => (
             <label key={m.id} className="pick-mode">
               <input type="radio" name="pick-mode" checked={mode === m.id} onChange={() => setMode(m.id)} />
               <span>
@@ -164,7 +170,12 @@ export function ListPickDialog({
       <div className="callout">
         <div className="faint" style={{ fontSize: 12.5 }}>Result</div>
         <code style={{ wordBreak: 'break-all' }}>{result.path}</code>
-        {multi && <span className="faint"> · {select === 'first' ? 'first' : select} match</span>}
+        {multi && ['vu', 'iteration', 'sequence'].includes(result.select ?? '') ? (
+          <span className="faint"> · {describePick(result)}</span>
+        ) : (
+          multi && <span className="faint"> · {select === 'first' ? 'first' : select} match</span>
+        )}
+        {wholeList && <span className="faint"> · saved as a list</span>}
         {sample.loading && step.sourceId !== undefined ? (
           <div className="row faint" style={{ marginTop: 6 }}>
             <Spinner /> Checking against the recorded response…

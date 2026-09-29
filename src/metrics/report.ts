@@ -206,7 +206,7 @@ function callHtml(c: CallSample): string {
     : '';
   return `<details class="${bad ? 'err' : 'okc'}"${bad ? ' open' : ''}><summary>
 <span class="st ${bad ? 'e' : 'g'}">${res ? res.status : 'no response'}</span><span>${ms(c.durationMs)}</span>
-<span class="muted">${c.phase === 'setup' ? 'setup' : c.phase === 'teardown' ? 'teardown' : `iteration ${c.iteration + 1}`} · virtual user ${c.vu + 1} · ${esc(when)}</span>${auth}
+<span class="muted">${c.phase === 'setup' ? 'setup' : c.phase === 'teardown' ? 'teardown' : `iteration ${c.iteration + 1}`} · virtual user ${c.vu + 1}${c.userRow !== undefined ? ` (users file row ${c.userRow})` : ''}${c.loop ? ` · ${esc(c.loop.as)} ${c.loop.index + 1} of ${c.loop.count}` : ''} · ${esc(when)}</span>${auth}
 ${c.error ? `<span class="bad">${esc(c.error)}</span>` : ''}</summary>
 <div class="cols"><div><h4>Request</h4><pre>${esc(`${req.method} ${req.url}`)}</pre>
 <h4>Request headers</h4><pre>${esc(headerLines(req.headers)) || none}</pre>

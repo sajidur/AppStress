@@ -85,8 +85,13 @@ export interface Extractor {
   regex?: string;
   group?: number;
   optional?: boolean;
-  /** when the JSON path matches several values (a [*] wildcard or a [?(...)] condition): which one to take. Default: first */
-  select?: 'first' | 'last' | 'random';
+  /**
+   * when the JSON path matches several values (a [*] wildcard or a [?(...)] condition): which one to take. Default: first.
+   * vu: a different one for each virtual user; iteration: the next one every iteration; sequence: both (vu + iteration).
+   */
+  select?: 'first' | 'last' | 'random' | 'vu' | 'iteration' | 'sequence';
+  /** save ALL matches as a list (a JSON array) instead of one value, to repeat steps for each item (Step.each) */
+  list?: boolean;
   /** used when nothing matches instead of failing the step; may contain ${templates}. Empty string is allowed */
   default?: string;
   /** filters applied to the value once it is read, e.g. "base64decode" or "base64decode|lower" */
@@ -100,6 +105,18 @@ export interface StepRequest {
   body?: string;
 }
 
+/** Repeat steps for every item of a list. */
+export interface LoopSpec {
+  /** name of the variable that holds the list (an extractor with list: true) */
+  list: string;
+  /** name of the item inside the loop, e.g. "customer" for \${customer.id} */
+  as: string;
+  /** at most this many items (default 1000) */
+  max?: number;
+  /** in the order of the list (default) or shuffled */
+  order?: 'sequential' | 'random';
+}
+
 export interface Step {
   name: string;
   /** logical page / transaction the step belongs to */
@@ -110,6 +127,11 @@ export interface Step {
   sourceId?: number;
   /** do not add the workflow-level authentication to this step (e.g. the login call itself) */
   skipAuth?: boolean;
+  /**
+   * Repeat this step for every item of a list an earlier step saved. Consecutive steps with the same list and name form the
+   * loop body: item 1 runs all of them, then item 2, and so on. Each item is available as \${as}, \${as.field}, \${as.$index}.
+   */
+  each?: LoopSpec;
   /**
    * Variables computed once before this step's request is built, e.g. {"requestId": "${$uuid}"}.
    * Later steps can use them too, so a client-generated id can be sent in several calls.
@@ -214,6 +236,10 @@ export interface CallSample {
   /** redirect hops followed before the final response */
   redirects?: { status: number; url: string }[];
   error?: string;
+  /** the row of the users file this call was made as (1 = first row), when a users file is used */
+  userRow?: number;
+  /** set when the call was made for one item of a loop (Step.each) */
+  loop?: { as: string; index: number; count: number };
   /** values this call saved for later steps */
   extracted: Record<string, string>;
   /** workflow authentication: applied, skipped (value not available yet) or own (the step sets it) */

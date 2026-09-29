@@ -1,9 +1,10 @@
 import { performance } from 'node:perf_hooks';
-import type { CallSample, Step, Workflow } from '../types.js';
+import type { CallSample, LoopSpec, Step, Workflow } from '../types.js';
 import { errorMessage, sleepInterruptible } from '../util.js';
 import { applyAuth } from './auth.js';
 import { CookieJar } from './cookies.js';
 import { parseSetCookies, runExtractor, type ResponseView } from './extract.js';
+import { isItemVar, itemVars, loopItems, sameLoop } from './loop.js';
 import { cut, maskHeaders, maskText, maskVars, type CallSampler } from './sampling.js';
 import { applyFilters, render, renderRecord, type Vars } from './template.js';
 
@@ -40,6 +41,8 @@ export interface StepTrace {
 export interface VirtualUserOptions {
   workflow: Workflow;
   user: Record<string, string>;
+  /** which row of the users file the user is (1 = first), shown in the call details */
+  userRow?: number;
   vuIndex: number;
   metrics: MetricSink;
   cache?: SharedCache;
@@ -75,14 +78,17 @@ export class VirtualUser {
   private phase: CallSample['phase'] = 'setup';
   private iteration = 0;
   private user: Record<string, string> = {};
+  private userRow?: number;
+  private loop?: { as: string; index: number; count: number };
 
   constructor(private readonly o: VirtualUserOptions) {
-    this.setUser(o.user);
+    this.setUser(o.user, o.userRow);
   }
 
   /** Swap the user (users-mode=per-iteration): fresh cookies and variables. */
-  setUser(user: Record<string, string>): void {
+  setUser(user: Record<string, string>, row?: number): void {
     this.user = user;
+    this.userRow = row;
     this.jar.clear();
     this.vars = { ...this.o.workflow.variables, $vu: String(this.o.vuIndex) };
     for (const [k, v] of Object.entries(user)) this.vars[`user.${k}`] = v;
@@ -90,7 +96,7 @@ export class VirtualUser {
 
   /** Start a new session for the same user: cookies and everything the steps saved are forgotten. */
   resetSession(): void {
-    this.setUser(this.user);
+    this.setUser(this.user, this.userRow);
   }
 
   runSetup(): Promise<boolean> {
@@ -118,18 +124,69 @@ export class VirtualUser {
 
   private async runSteps(steps: Step[], teardown = false): Promise<boolean> {
     const stop = teardown ? (this.o.shouldAbort ?? this.o.shouldStop) : this.o.shouldStop;
+    // a failed step ends the sequence, except with onError=continue, and in the teardown (every logout step must be tried)
+    const keepGoing = () => teardown || this.o.workflow.onError === 'continue';
     let allOk = true;
-    for (const step of steps) {
-      if (stop()) return false;
-      const think = (step.thinkTimeMs ?? 0) * this.o.thinkTimeScale;
-      if (think > 0) await sleepInterruptible(think, stop);
-      if (stop()) return false;
-      const ok = await this.execStep(step);
-      if (!ok) {
-        allOk = false;
-        // a failed logout call must not keep the other teardown steps from running
-        if (!teardown && this.o.workflow.onError !== 'continue') return false;
+    for (let i = 0; i < steps.length; ) {
+      const step = steps[i];
+      if (step.each) {
+        // consecutive steps that repeat over the same list are one loop body
+        let j = i + 1;
+        while (j < steps.length && sameLoop(steps[j].each, step.each)) j++;
+        const ok = await this.runLoop(steps.slice(i, j), step.each, stop, keepGoing);
+        i = j;
+        if (!ok) {
+          allOk = false;
+          if (!keepGoing()) return false;
+        }
+        continue;
       }
+      i++;
+      const r = await this.runOne(step, stop);
+      if (r === 'stop') return false;
+      if (r === 'fail') {
+        allOk = false;
+        if (!keepGoing()) return false;
+      }
+    }
+    return allOk;
+  }
+
+  private async runOne(step: Step, stop: () => boolean): Promise<'ok' | 'fail' | 'stop'> {
+    if (stop()) return 'stop';
+    const think = (step.thinkTimeMs ?? 0) * this.o.thinkTimeScale;
+    if (think > 0) await sleepInterruptible(think, stop);
+    if (stop()) return 'stop';
+    return (await this.execStep(step)) ? 'ok' : 'fail';
+  }
+
+  /** Run the steps of a loop body once for every item of the list an earlier step saved. */
+  private async runLoop(block: Step[], spec: LoopSpec, stop: () => boolean, keepGoing: () => boolean): Promise<boolean> {
+    const items = loopItems(this.vars[spec.list], spec);
+    if (typeof items === 'string') {
+      const first = block[0];
+      this.o.metrics.record(first.name, 0, 0, items);
+      const call = this.sample(first, { method: first.request.method, url: first.request.url, headers: { ...(first.request.headers ?? {}) }, body: first.request.body, ms: 0, error: items, extracted: {} });
+      this.o.onTrace?.({ step: first.name, method: first.request.method, url: first.request.url, status: 0, durationMs: 0, error: items, extracted: {}, call });
+      return false;
+    }
+    let allOk = true;
+    try {
+      for (let index = 0; index < items.length; index++) {
+        for (const name of Object.keys(this.vars)) if (isItemVar(name, spec.as)) delete this.vars[name];
+        Object.assign(this.vars, itemVars(spec.as, items[index], index, items.length));
+        this.loop = { as: spec.as, index, count: items.length };
+        for (const step of block) {
+          const r = await this.runOne(step, stop);
+          if (r === 'stop') return false;
+          if (r === 'fail') {
+            allOk = false;
+            if (!keepGoing()) return false;
+          }
+        }
+      }
+    } finally {
+      this.loop = undefined;
     }
     return allOk;
   }
@@ -205,7 +262,7 @@ export class VirtualUser {
     const extracted: Vars = { ...generated };
     if (!error) {
       for (const ex of step.extract ?? []) {
-        let v = runExtractor(ex, res);
+        let v = runExtractor(ex, res, { vu: this.o.vuIndex, iteration: this.iteration });
         if (v === undefined && ex.default !== undefined) {
           try {
             v = render(ex.default, this.vars);
@@ -286,6 +343,8 @@ export class VirtualUser {
       at: Date.now() - Math.round(c.ms),
       vu: this.o.vuIndex,
       iteration: this.iteration,
+      ...(this.userRow !== undefined ? { userRow: this.userRow } : {}),
+      ...(this.loop ? { loop: this.loop } : {}),
       durationMs: c.ms,
       request: {
         method: c.method,

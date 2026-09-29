@@ -8,7 +8,7 @@ import type { Extractor, Step, Workflow } from '../types.js';
  * Pure and dependency-free, so the server (build report) and the browser (live while editing) share it.
  */
 
-export type FlowOrigin = 'step' | 'user' | 'generated';
+export type FlowOrigin = 'step' | 'user' | 'generated' | 'loop';
 
 export interface FlowInput {
   /** where in the request the value goes, e.g. `query "page"`, `header "x-csrf"`, `body "itemId"`, `URL path` */
@@ -24,6 +24,16 @@ export interface FlowInput {
   how: string;
   /** origin=step: the request that produced it comes before this one */
   ordered: boolean;
+}
+
+/** A field of a request that always carries the value that was recorded (a login name, a password). */
+export interface FixedField {
+  /** where it is, as in FlowInput.where: `body "userName"`, `query "u"` */
+  where: string;
+  /** the field's name */
+  key: string;
+  /** the recorded value (shortened) */
+  value: string;
 }
 
 export interface FlowOutput {
@@ -48,6 +58,10 @@ export interface FlowStep {
   generates: { variable: string; how: string }[];
   /** fixed values in the request that look dynamic (tokens, ids): every user sends this same recorded value */
   fixedDynamic: { where: string; value: string; kind: string }[];
+  /** login-like fields (user name, password, email) that carry the same recorded value for every virtual user */
+  fixedCredentials: FixedField[];
+  /** the step repeats for every item of a list an earlier step saved */
+  loop?: { list: string; as: string };
 }
 
 export interface FlowIssue {
@@ -57,8 +71,10 @@ export interface FlowIssue {
   /** what to do about it */
   hint?: string;
   /** machine-readable kind, so the UI can offer a fix */
-  kind: 'unresolved' | 'too-early' | 'unused' | 'fixed-position' | 'encrypted' | 'encoded' | 'unexplained';
+  kind: 'unresolved' | 'too-early' | 'unused' | 'fixed-position' | 'encrypted' | 'encoded' | 'unexplained' | 'fixed-credentials';
   variable?: string;
+  /** fixed-credentials: which field, so the UI can offer to take it from a users-file column */
+  field?: FixedField;
 }
 
 export interface FlowReport {
@@ -70,8 +86,11 @@ export interface FlowReport {
 
 const PLACEHOLDER = /\$\{\s*([^}|]+?)\s*(?:\|([^}]*))?\}/g;
 
+const PICK_WORDS: Record<string, string> = { last: 'last', random: 'random', vu: 'a different one per virtual user', iteration: 'the next one every iteration', sequence: 'a different one per user and iteration' };
+
 const describeExtractor = (e: Extractor): string => {
-  const pick = e.select && e.select !== 'first' && e.path && isMultiPath(e.path) ? ` (${e.select})` : '';
+  if (e.list && e.from === 'body') return `${e.path} (all items, as a list)`;
+  const pick = e.select && e.select !== 'first' && e.path && isMultiPath(e.path) ? ` (${PICK_WORDS[e.select] ?? e.select})` : '';
   const fallback = e.default !== undefined ? `, else "${e.default}"` : '';
   if (e.from === 'body') return `${e.path}${pick}${fallback}`;
   if (e.from === 'regex') return `regex ${e.regex}`;
@@ -121,6 +140,27 @@ function fixedDynamic(step: Step, defaults: Record<string, string> = {}): FlowSt
 /** ' -> base64 -> urlencode' when a value is transformed before it is sent */
 const sentAs = (filters?: string) => (filters ? ` -> ${filters.split('|').map((x) => x.trim()).filter(Boolean).join(' -> ')}` : '');
 
+/** field names that identify who logs in */
+const CREDENTIAL_KEY = /^(user[_-]?(name|id|login)?|login([_-]?(name|id))?|e[-_]?mail|account([_-]?(id|name|no))?|employee[_-]?(id|no|code)?|customer[_-]?(id|no)|password|passwd|pwd|pass|passcode|otp|pin)$/i;
+
+/** Login-like fields that carry a fixed (recorded) value: every virtual user would send the same one. */
+function fixedCredentialFields(step: Step): FixedField[] {
+  const out: FixedField[] = [];
+  const seen = new Set<string>();
+  const add = (where: string, key: string, value: string) => {
+    const v = value.trim();
+    if (!v || v.includes('${') || !CREDENTIAL_KEY.test(key) || seen.has(where)) return;
+    seen.add(where);
+    out.push({ where, key, value: v.length > 30 ? `${v.slice(0, 27)}...` : v });
+  };
+  const body = step.request.body ?? '';
+  for (const m of body.matchAll(/"([A-Za-z0-9_.-]+)"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) add(`body "${m[1]}"`, m[1], m[2]);
+  if (!/^\s*[{[]/.test(body)) for (const p of body.split('&')) if (p.includes('=')) add(`body "${decodeURIComponent(p.split('=')[0])}"`, decodeURIComponent(p.split('=')[0]), p.slice(p.indexOf('=') + 1));
+  const q = step.request.url.indexOf('?');
+  if (q >= 0) for (const p of step.request.url.slice(q + 1).split('&')) if (p.includes('=')) add(`query "${p.split('=')[0]}"`, p.split('=')[0], p.slice(p.indexOf('=') + 1));
+  return out;
+}
+
 const urlPath = (url: string) => url.replace(/^\$\{[^}]+\}/, '').replace(/^https?:\/\/[^/]+/, '') || '/';
 
 /** Pull the placeholders out of a step's request, with where each one is used. */
@@ -141,6 +181,7 @@ function placeholdersOf(step: Step): { where: string; text: string; name: string
 }
 
 export function analyzeFlow(wf: Workflow, opts: { userColumns?: string[] } = {}): FlowReport {
+  const hasUsers = !!opts.userColumns?.length;
   const ordered = [
     ...wf.setup.map((step, index) => ({ step, phase: 'setup' as const, index })),
     ...wf.steps.map((step, index) => ({ step, phase: 'steps' as const, index })),
@@ -162,6 +203,21 @@ export function analyzeFlow(wf: Workflow, opts: { userColumns?: string[] } = {})
   ordered.forEach(({ step, phase, index }, at) => {
     const inputs: FlowInput[] = [];
     const uses = placeholdersOf(step);
+    const loop = step.each;
+    // the list this step repeats over is an input of the step
+    if (loop) {
+      const p = producer.get(loop.list);
+      if (!p) {
+        issues.push({ level: 'warn', step: step.name, kind: 'unresolved', variable: loop.list, message: `${step.name} repeats for each item of ${loop.list}, but no step saves a list with that name`, hint: 'Save a list from an earlier response: on that step choose "Which item…" → "Every item".' });
+      } else {
+        const early = p.at >= at;
+        inputs.push({ where: 'repeats for each item of', text: `${'$'}{${loop.list}}`, origin: 'step', variable: loop.list, from: p.step.name, how: p.how, ordered: !early });
+        if (early) issues.push({ level: 'warn', step: step.name, kind: 'too-early', variable: loop.list, message: `${step.name} repeats over ${loop.list}, which is only saved later by ${p.step.name}` });
+        if (!usedBy.has(loop.list)) usedBy.set(loop.list, new Set());
+        usedBy.get(loop.list)!.add(step.name);
+        links++;
+      }
+    }
     if (wf.auth && !step.skipAuth) {
       for (const [where, t] of [['authentication token', wf.auth.token], ['authentication username', wf.auth.username], ['authentication password', wf.auth.password], ['authentication value', wf.auth.value]] as const) {
         if (!t) continue;
@@ -172,7 +228,12 @@ export function analyzeFlow(wf: Workflow, opts: { userColumns?: string[] } = {})
     for (const u of uses) {
       const name = u.name;
       let input: FlowInput | undefined;
-      if (name.startsWith('$')) {
+      if (loop && (name === loop.as || name.startsWith(`${loop.as}.`))) {
+        // an item of the loop this step repeats
+        const p = producer.get(loop.list);
+        const field = name === loop.as ? 'the item' : name.slice(loop.as.length + 1);
+        input = { where: u.where, text: u.text, origin: 'loop', variable: name, from: p?.step.name, how: `${field === 'the item' ? 'each item' : field.startsWith('$') ? field.slice(1) : `field "${field}"`} of ${loop.list}${sentAs(u.filters)}`, ordered: true };
+      } else if (name.startsWith('$')) {
         input = { where: u.where, text: u.text, origin: 'generated', variable: name, how: name.replace(/^\$/, '').replace(/\(.*$/, '') + ' (new value every call)', ordered: true };
       } else if (name.startsWith('user.')) {
         const col = name.slice(5);
@@ -207,6 +268,19 @@ export function analyzeFlow(wf: Workflow, opts: { userColumns?: string[] } = {})
       inputs.push(input);
     }
 
+    const credentials = fixedCredentialFields(step);
+    for (const c of credentials) {
+      issues.push({
+        level: 'warn',
+        step: step.name,
+        kind: 'fixed-credentials',
+        variable: c.key,
+        field: c,
+        message: `${step.name} sends the same ${c.key} (${c.value}) for every virtual user${hasUsers ? ', although a users file is loaded' : ''}`,
+        hint: hasUsers ? 'Take it from a users-file column, so every virtual user logs in as a different user.' : 'Upload a users file (Test users tab), then take it from a column.',
+      });
+    }
+
     const fixed = fixedDynamic(step, wf.defaults?.headers);
     for (const f of fixed) {
       issues.push({
@@ -223,6 +297,8 @@ export function analyzeFlow(wf: Workflow, opts: { userColumns?: string[] } = {})
       phase,
       index,
       fixedDynamic: fixed,
+      fixedCredentials: credentials,
+      ...(loop ? { loop: { list: loop.list, as: loop.as } } : {}),
       method: step.request.method.toUpperCase(),
       path: urlPath(step.request.url),
       inputs,

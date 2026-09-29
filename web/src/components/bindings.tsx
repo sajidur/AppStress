@@ -9,6 +9,7 @@ import {
   sameExtractor,
   newParamName,
   stepsBefore,
+  stepsOf,
   suggestVarName,
   uniqueVarName,
   type JsonField,
@@ -18,6 +19,7 @@ import {
 } from '../bindings';
 import { useAsync } from '../hooks';
 import { FILTERS } from '../../../src/engine/filter-names';
+import { fieldSource, withSource } from '../sources';
 import type { Extractor, Workflow } from '../types';
 import { Modal, Spinner } from './ui';
 
@@ -29,6 +31,8 @@ export interface BindContext {
   ref: StepRef;
   userColumns: string[];
   extraVars: string[];
+  /** fields of one item of the loop the step repeats over (learnt from the recorded response) */
+  loopFields?: string[];
   /** add an extractor to an earlier step so its value becomes available as ${var} */
   addExtractor: (source: StepRef, ex: Extractor) => void;
 }
@@ -280,6 +284,7 @@ export function PickExtractorDialog({
 /* ================================================================= variable menu */
 
 const GROUPS: { kind: VarInfo['kind']; title: string }[] = [
+  { kind: 'loop', title: 'Item of the loop' },
   { kind: 'step', title: 'From earlier steps' },
   { kind: 'user', title: 'User data (users file)' },
   { kind: 'variable', title: 'Workflow variables' },
@@ -293,7 +298,7 @@ export function VarMenu({ ctx, filter, onInsert }: { ctx: BindContext; filter?: 
   // how the value is sent: as it is, or encoded (Base64, hex, a hash) the way the server expects it
   const [encoding, setEncoding] = useState('');
   const box = useRef<HTMLDivElement>(null);
-  const vars = useMemo(() => availableVars(ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars), [ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars]);
+  const vars = useMemo(() => availableVars(ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars, ctx.loopFields), [ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars, ctx.loopFields]);
   const canBind = stepsBefore(ctx.workflow, ctx.ref).length > 0;
 
   useEffect(() => {
@@ -441,6 +446,50 @@ export function BindField({
   );
 }
 
+
+/** Where the value of a field comes from: a fixed value, the users file, an earlier step, a generator, or the loop item. */
+export function SourceSelect({ value, onChange, ctx, context }: { value: string; onChange: (v: string) => void; ctx: BindContext; context?: string }) {
+  const own = stepsOf(ctx.workflow, ctx.ref.phase)[ctx.ref.index];
+  const src = fieldSource(value, own?.each?.as);
+  const vars = useMemo(() => availableVars(ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars, ctx.loopFields), [ctx.workflow, ctx.ref, ctx.userColumns, ctx.extraVars, ctx.loopFields]);
+  const current = src.kind === 'fixed' ? 'fixed' : src.kind === 'mixed' ? 'mixed' : `var:${src.name}`;
+  const known = vars.some((v) => `var:${v.name}` === current);
+  const group = (kind: VarInfo['kind'], label: string) => {
+    const list = vars.filter((v) => v.kind === kind);
+    return list.length ? (
+      <optgroup label={label}>
+        {list.map((v) => (
+          <option key={v.name} value={`var:${v.name}`}>
+            {kind === 'user' ? v.name.replace(/^user\./, '') : v.name} — {v.source}
+          </option>
+        ))}
+      </optgroup>
+    ) : null;
+  };
+  return (
+    <select
+      className="source-select"
+      aria-label="Where the value comes from"
+      title="Where this value comes from"
+      value={current}
+      onChange={(e) => {
+        const v = e.target.value;
+        if (v === 'fixed') onChange('');
+        else if (v.startsWith('var:')) onChange(withSource(v.slice(4), src.kind === 'fixed' || src.kind === 'mixed' ? undefined : src, context));
+      }}
+    >
+      <option value="fixed">Fixed value</option>
+      {src.kind === 'mixed' && <option value="mixed">Text with values inside</option>}
+      {current.startsWith('var:') && !known && <option value={current}>{src.name}</option>}
+      {group('user', 'Users file')}
+      {group('step', 'Earlier steps')}
+      {group('loop', 'Loop item')}
+      {group('builtin', 'Generated')}
+      {group('variable', 'Workflow variables')}
+    </select>
+  );
+}
+
 /** Table of key/value pairs (query parameters or form fields) whose values can be bound. */
 export function ParamTable({
   params,
@@ -463,6 +512,7 @@ export function ParamTable({
         <div className="row" key={i} style={{ flexWrap: 'nowrap', alignItems: 'center' }}>
           <input type="text" className="mono" style={{ width: 170, flex: 'none' }} aria-label={`${what} name`} value={p.key} readOnly={!editableKeys} onChange={(e) => set(i, { key: e.target.value })} />
           <span className="faint">=</span>
+          <SourceSelect value={p.value} onChange={(v) => set(i, { value: v, bare: undefined })} ctx={ctx} context={filterFor('url')} />
           <div style={{ flex: 1, minWidth: 0 }}>
             <BindField value={p.value} onChange={(v) => set(i, { value: v, bare: undefined })} ctx={ctx} filter={filterFor('url')} replace ariaLabel={`${p.key} value`} />
           </div>
@@ -490,6 +540,7 @@ export function JsonFieldTable({ fields, onSet, ctx }: { fields: JsonField[]; on
           <span className="mono json-key" title={f.label}>
             {f.label}
           </span>
+          <SourceSelect value={f.value} onChange={(v) => onSet(f, v)} ctx={ctx} context={filterFor(f.raw ? 'json-raw' : 'json-string')} />
           <div style={{ flex: 1, minWidth: 0 }}>
             <BindField value={f.value} onChange={(v) => onSet(f, v)} ctx={ctx} filter={filterFor(f.raw ? 'json-raw' : 'json-string')} replace ariaLabel={`${f.label} value`} />
           </div>

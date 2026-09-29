@@ -1,10 +1,19 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { analyzeFlow, type FlowInput, type FlowIssue, type FlowStep } from '../../../../src/builder/flow';
 import { Card, MethodTag } from '../../components/ui';
+import { guessColumn } from '../../sources';
 import type { BuildReport, Workflow } from '../../types';
+import type { FixedField } from '../../../../src/builder/flow';
 
 function Origin({ input }: { input: FlowInput }) {
   if (input.origin === 'user') return <span className="flow-chip user" title={input.how}>👤 {input.how.replace('users file, column ', 'users file · ').replace(/"/g, '')}</span>;
+  if (input.origin === 'loop') {
+    return (
+      <span className="flow-chip loop" title={input.how}>
+        🔁 {input.how}
+      </span>
+    );
+  }
   if (input.origin === 'generated') {
     return (
       <span className="flow-chip gen" title={input.how}>
@@ -28,10 +37,15 @@ function StepCard({ s, n, onPick, onRemove }: { s: FlowStep; n: number; onPick: 
         <span className="mono flow-path" title={s.name}>
           {s.path}
         </span>
+        {s.loop && (
+          <span className="chip" title="This step runs once for every item of the list">
+            ↻ each {s.loop.as} of {s.loop.list}
+          </span>
+        )}
         <span className="chip">{s.phase === 'setup' ? 'once per user' : s.phase === 'teardown' ? 'when the session ends' : 'every iteration'}</span>
       </div>
       <div className="flow-body">
-        {s.inputs.length === 0 && s.generates.length === 0 && s.outputs.length === 0 && s.fixedDynamic.length === 0 && <div className="faint">Nothing flows in or out. This request is the same for every user.</div>}
+        {s.inputs.length === 0 && s.generates.length === 0 && s.outputs.length === 0 && s.fixedDynamic.length === 0 && s.fixedCredentials.length === 0 && <div className="faint">Nothing flows in or out. This request is the same for every user.</div>}
 
         {s.inputs.length > 0 && (
           <div className="flow-block">
@@ -43,6 +57,23 @@ function StepCard({ s, n, onPick, onRemove }: { s: FlowStep; n: number; onPick: 
                   <span className="faint">←</span>
                   <Origin input={i} />
                   <code className="faint">{i.text}</code>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {s.fixedCredentials.length > 0 && (
+          <div className="flow-block">
+            <div className="flow-label warn">same user</div>
+            <div className="flow-rows">
+              {s.fixedCredentials.map((f, k) => (
+                <div className="flow-row" key={k}>
+                  <span className="flow-where">{f.where}</span>
+                  <span className="faint">=</span>
+                  <span className="flow-chip bad" title="Every virtual user sends this recorded value, so every virtual user is the same user">
+                    the recorded value for everyone · <code>{f.value}</code>
+                  </span>
                 </div>
               ))}
             </div>
@@ -114,7 +145,20 @@ function StepCard({ s, n, onPick, onRemove }: { s: FlowStep; n: number; onPick: 
   );
 }
 
-function Issue({ i, onPick, onRemove }: { i: FlowIssue; onPick: (step: string, variable: string) => void; onRemove: (step: string, variable: string) => void }) {
+function Issue({
+  i,
+  columns,
+  onPick,
+  onRemove,
+  onBind,
+}: {
+  i: FlowIssue;
+  columns: string[];
+  onPick: (step: string, variable: string) => void;
+  onRemove: (step: string, variable: string) => void;
+  onBind: (step: string, field: FixedField, column: string) => void;
+}) {
+  const [column, setColumn] = useState(i.field ? (guessColumn(i.field.key, columns) ?? columns[0] ?? '') : '');
   return (
     <div className={`callout ${i.level === 'warn' ? 'warn' : ''}`} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
       <span aria-hidden>{i.level === 'warn' ? '⚠' : 'ℹ'}</span>
@@ -126,6 +170,20 @@ function Issue({ i, onPick, onRemove }: { i: FlowIssue; onPick: (step: string, v
         <button className="btn small" onClick={() => onPick(i.step!, i.variable!)}>
           Make dynamic…
         </button>
+      )}
+      {i.kind === 'fixed-credentials' && i.step && i.field && (
+        columns.length ? (
+          <div className="row" style={{ flexWrap: 'nowrap', gap: 6 }}>
+            <select aria-label="Users-file column" value={column} onChange={(e) => setColumn(e.target.value)} style={{ width: 150, height: 30 }}>
+              {columns.map((c) => (
+                <option key={c}>{c}</option>
+              ))}
+            </select>
+            <button className="btn small primary" onClick={() => onBind(i.step!, i.field!, column)}>
+              Take it from this column
+            </button>
+          </div>
+        ) : null
       )}
       {i.kind === 'unused' && i.step && i.variable && (
         <button className="btn small ghost" onClick={() => onRemove(i.step!, i.variable!)}>
@@ -146,17 +204,21 @@ export function FlowPanel({
   report,
   onPick,
   onRemove,
+  onBindCredential,
 }: {
   workflow: Workflow;
   userColumns: string[];
   report: BuildReport | null;
   onPick: (step: string, variable: string) => void;
   onRemove: (step: string, variable: string) => void;
+  /** replace a fixed login value by a users-file column */
+  onBindCredential: (step: string, field: FixedField, column: string) => void;
 }) {
   const flow = useMemo(() => analyzeFlow(workflow, { userColumns }), [workflow, userColumns]);
   // problems found while recording (typed values the page transforms) do not show up in the workflow itself
   const recorded = (report?.flow?.issues ?? []).filter((i) => i.kind === 'encrypted');
-  const issues = [...recorded, ...flow.issues.filter((i) => i.level === 'warn'), ...flow.issues.filter((i) => i.level === 'info')];
+  // a login that sends the same user to everyone is the most important thing to know: first
+  const issues = [...flow.issues.filter((i) => i.kind === 'fixed-credentials'), ...recorded, ...flow.issues.filter((i) => i.level === 'warn' && i.kind !== 'fixed-credentials'), ...flow.issues.filter((i) => i.level === 'info')];
   const total = workflow.setup.length + workflow.steps.length + (workflow.teardown?.length ?? 0);
 
   return (
@@ -175,6 +237,7 @@ export function FlowPanel({
           <span className="flow-chip user">👤 users file</span>
           <span className="flow-chip step">↩ from an earlier response</span>
           <span className="flow-chip gen">⚙ generated for every call</span>
+          <span className="flow-chip loop">🔁 item of a repeated list</span>
           <span className="flow-chip bad">same for every user</span>
           <span className="faint">
             · {flow.links} value{flow.links === 1 ? '' : 's'} handed from one step to another
@@ -184,7 +247,7 @@ export function FlowPanel({
         {issues.length > 0 && (
           <div className="stack" style={{ gap: 6 }}>
             {issues.map((i, k) => (
-              <Issue key={k} i={i} onPick={onPick} onRemove={onRemove} />
+              <Issue key={`${i.kind}|${i.step}|${i.field?.where ?? i.variable ?? k}`} i={i} columns={userColumns} onPick={onPick} onRemove={onRemove} onBind={onBindCredential} />
             ))}
           </div>
         )}

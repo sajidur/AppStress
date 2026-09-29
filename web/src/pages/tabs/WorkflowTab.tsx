@@ -32,6 +32,7 @@ import { CallDetail } from '../../components/CallDetail';
 import { ListPickDialog } from '../../components/ListPickDialog';
 import { describePick, splitListPath } from '../../listpick';
 import { FILTERS } from '../../../../src/engine/filter-names';
+import { bindLiteral, itemName, listProducer, listVars, loopFieldsFromSample } from '../../sources';
 import { isMultiPath } from '../../../../src/engine/jsonpath';
 import { FlowPanel } from './FlowPanel';
 import { useAsync } from '../../hooks';
@@ -478,6 +479,8 @@ function AuthPanel({ draft, setDraft, ctx }: { draft: Workflow; setDraft: (fn: (
 
 /* ================================================================= step editor */
 
+const sameLoopSpec = (a?: Step['each'], b?: Step['each']) => !!a && !!b && a.list === b.list && a.as === b.as;
+
 const headersToText = (h?: Record<string, string>) => Object.entries(h ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n');
 const textToHeaders = (t: string) => {
   const out: Record<string, string> = {};
@@ -488,7 +491,15 @@ const textToHeaders = (t: string) => {
   return out;
 };
 
-function StepEditor({ step, ctx, hasAuth, onChange, onPickItem }: { step: Step; ctx: BindContext; hasAuth: boolean; onChange: (s: Step) => void; onPickItem: (variable: string) => void }) {
+function StepEditor({ step, ctx: baseCtx, hasAuth, onChange, onPickItem, onRepeatNext }: { step: Step; ctx: BindContext; hasAuth: boolean; onChange: (s: Step) => void; onPickItem: (variable: string) => void; onRepeatNext?: () => void }) {
+  // fields of one item of the list this step repeats over, learnt from the recorded response of the step that saved it
+  const producer = step.each ? listProducer(baseCtx.workflow, step.each.list) : null;
+  const producerSample = useAsync(
+    () => (producer?.step.sourceId === undefined ? Promise.resolve(null) : api.responseSample(baseCtx.testId, producer.step.sourceId)),
+    [baseCtx.testId, producer?.step.sourceId],
+  );
+  const loopFields = useMemo(() => loopFieldsFromSample(producer?.path, producerSample.data?.jsonPaths ?? []), [producer?.path, producerSample.data]);
+  const ctx = useMemo(() => ({ ...baseCtx, loopFields }), [baseCtx, loopFields]);
   const [headersText, setHeadersText] = useState(headersToText(step.request.headers));
   const [rawBody, setRawBody] = useState(false);
   const [picking, setPicking] = useState<number | null>(null);
@@ -578,6 +589,78 @@ function StepEditor({ step, ctx, hasAuth, onChange, onPickItem }: { step: Step; 
         />
       </Field>
 
+      <Section
+        title="Repeat for each item of a list"
+        hint="Customers, orders or products that an earlier response returned: run this request once for every item, each time with that item's own values."
+      >
+        {(() => {
+          const lists = listVars(ctx.workflow, ctx.ref);
+          if (!step.each && lists.length === 0) {
+            return (
+              <div className="faint" style={{ fontSize: 13 }}>
+                No earlier step saves a list yet. On the step that returns your customers, open <b>Which item…</b> on the value you use from it and choose <b>Every item</b>. Then come back here.
+              </div>
+            );
+          }
+          const each = step.each;
+          return (
+            <div className="stack" style={{ gap: 8 }}>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={!!each}
+                  onChange={(e) => set({ each: e.target.checked ? { list: lists[0].name, as: itemName(lists[0].name) } : undefined })}
+                />
+                Repeat this step for every item of a list
+              </label>
+              {each && (
+                <>
+                  <div className="grid-2">
+                    <Field label="The list" htmlFor="loop-list">
+                      <select id="loop-list" value={each.list} onChange={(e) => set({ each: { ...each, list: e.target.value, as: each.as || itemName(e.target.value) } })}>
+                        {!lists.some((l) => l.name === each.list) && <option value={each.list}>{each.list} (not saved by an earlier step)</option>}
+                        {lists.map((l) => (
+                          <option key={l.name} value={l.name}>
+                            {l.name} — from {l.source}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Field label="Call each item" htmlFor="loop-as" help={<>Then use <code>{'${' + (each.as || 'item') + '.id}'}</code>, <code>{'${' + (each.as || 'item') + '.name}'}</code>, ... in this step.</>}>
+                      <input id="loop-as" type="text" className="mono" value={each.as} onChange={(e) => set({ each: { ...each, as: e.target.value.replace(/[^A-Za-z0-9_]/g, '') } })} />
+                    </Field>
+                  </div>
+                  <div className="row" style={{ gap: 14 }}>
+                    <label className="row" style={{ gap: 6 }}>
+                      <span className="muted">At most</span>
+                      <input type="number" min={1} aria-label="Maximum number of items" style={{ width: 90 }} value={each.max ?? ''} placeholder="1000" onChange={(e) => set({ each: { ...each, max: Number(e.target.value) > 0 ? Number(e.target.value) : undefined } })} />
+                      <span className="muted">items</span>
+                    </label>
+                    <label className="row" style={{ gap: 6 }}>
+                      <span className="muted">Order</span>
+                      <select aria-label="Order of the items" value={each.order ?? 'sequential'} onChange={(e) => set({ each: { ...each, order: e.target.value === 'random' ? 'random' : undefined } })} style={{ width: 150 }}>
+                        <option value="sequential">as returned</option>
+                        <option value="random">shuffled</option>
+                      </select>
+                    </label>
+                    {onRepeatNext && (
+                      <button className="btn small" onClick={onRepeatNext} title="Steps that repeat over the same list one after another form one loop: item 1 runs all of them, then item 2, ...">
+                        Repeat the next step too
+                      </button>
+                    )}
+                  </div>
+                  {loopFields.length > 0 && (
+                    <div className="faint" style={{ fontSize: 12.5 }}>
+                      Fields of each item: {loopFields.slice(0, 12).map((f) => (<code key={f} style={{ marginRight: 6 }}>{'${' + each.as + '.' + f + '}'}</code>))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })()}
+      </Section>
+
       {hasAuth && (
         <label className="check">
           <input type="checkbox" checked={!!step.skipAuth} onChange={(e) => set({ skipAuth: e.target.checked || undefined })} />
@@ -642,6 +725,11 @@ function StepEditor({ step, ctx, hasAuth, onChange, onPickItem }: { step: Step; 
             <label className="check" title="Do not fail the step when nothing matches">
               <input type="checkbox" checked={!!ex.optional} onChange={(e) => setEx(i, { optional: e.target.checked || undefined })} /> optional
             </label>
+            {ex.from === 'body' && (
+              <label className="check" title="Save every match as a list, to repeat steps for each item">
+                <input type="checkbox" checked={!!ex.list} onChange={(e) => setEx(i, { list: e.target.checked || undefined, select: e.target.checked ? undefined : ex.select })} /> list
+              </label>
+            )}
             <button className="btn icon ghost" aria-label="Remove extractor" onClick={() => set({ extract: extractors.filter((_, j) => j !== i) })}>
               ✕
             </button>
@@ -770,6 +858,7 @@ function StepList({
               <span className="name" title={s.request.url}>
                 {s.name.startsWith(`${s.request.method.toUpperCase()} `) ? s.name.slice(s.request.method.length + 1) : s.name}
               </span>
+              {s.each && <span className="chip" title={`Runs once for every item of ${s.each.list}`}>↻ each {s.each.as}</span>}
               {s.resourceType && !['xhr', 'fetch'].includes(s.resourceType) && <span className="chip">{s.resourceType === 'script' ? 'js' : s.resourceType}</span>}
               {(s.thinkTimeMs ?? 0) > 0 && <span className="chip">⏱ {fmt.ms(s.thinkTimeMs)}</span>}
               {uses.length > 0 && <span className="chip" title="Values this request takes from earlier steps">⇠ {uses.join(', ')}</span>}
@@ -805,7 +894,14 @@ function StepList({
                 </button>
               </div>
             </div>
-            {open === i && <StepEditor step={s} ctx={ctxFor(ref)} hasAuth={!!wf.auth} onChange={(ns) => onEdit(i, ns)} onPickItem={(v) => onPickItem(s.name, v)} />}
+            {open === i && <StepEditor
+                step={s}
+                ctx={ctxFor(ref)}
+                hasAuth={!!wf.auth}
+                onChange={(ns) => onEdit(i, ns)}
+                onPickItem={(v) => onPickItem(s.name, v)}
+                onRepeatNext={s.each && steps[i + 1] && !sameLoopSpec(steps[i + 1].each, s.each) ? () => onEdit(i + 1, { ...steps[i + 1], each: s.each }) : undefined}
+              />}
           </div>
         );
       })}
@@ -964,6 +1060,22 @@ export function WorkflowTab(props: TabProps) {
     }
     return null;
   };
+  // "log in as a different user": replace a fixed value in a login request by a column of the users file
+  const bindCredential = (stepName: string, field: { where: string; key: string }, column: string) => {
+    if (!draft) return;
+    for (const phase of ['setup', 'steps', 'teardown'] as const) {
+      const index = stepsOf(draft, phase).findIndex((s) => s.name === stepName);
+      if (index < 0) continue;
+      const next = bindLiteral(stepsOf(draft, phase)[index], field.where, field.key, `user.${column}`);
+      if (!next) {
+        toast(`Could not change ${field.where}. Edit it in the step instead.`, 'error');
+        return;
+      }
+      editStep({ phase, index }, next);
+      toast(`${field.key} now comes from the users-file column "${column}"`);
+      return;
+    }
+  };
   const removeExtractor = (stepName: string, variable: string) => {
     const at = locate(stepName, variable);
     if (at) editStep(at.ref, { ...at.step, extract: at.step.extract!.filter((_, j) => j !== at.i) });
@@ -1006,7 +1118,7 @@ export function WorkflowTab(props: TabProps) {
     <div className="stack">
       <BuildPanel {...props} dirty={dirty} />
       {draft && !jsonMode && (
-        <FlowPanel workflow={draft} userColumns={userColumns} report={test.buildReport} onPick={(step, variable) => setPick({ step, variable })} onRemove={removeExtractor} />
+        <FlowPanel workflow={draft} userColumns={userColumns} report={test.buildReport} onPick={(step, variable) => setPick({ step, variable })} onRemove={removeExtractor} onBindCredential={bindCredential} />
       )}
       {draft && !jsonMode && <AuthPanel draft={draft} setDraft={setDraft} ctx={ctxFor({ phase: 'steps', index: draft.steps.length })} />}
       {draft && (
@@ -1063,10 +1175,7 @@ export function WorkflowTab(props: TabProps) {
                 onChange={(steps) => setDraft({ ...draft, steps })}
                 onEdit={(i, s) => editStep({ phase: 'steps', index: i }, s)}
                 onPickItem={(step, variable) => setPick({ step, variable })}
-                moves={[
-                  { label: '→ setup', title: 'Run once per virtual user instead', onMove: (i) => setDraft(moveBetween(draft, 'steps', i, 'setup')) },
-                  { label: '→ logout', title: 'Run when the user\'s session ends (teardown) instead', onMove: (i) => setDraft(moveBetween(draft, 'steps', i, 'teardown')) },
-                ]}
+                moves={[{ label: '→ setup', title: 'Run once per virtual user instead', onMove: (i) => setDraft(moveBetween(draft, 'steps', i, 'setup')) }]}
               />
               <StepList
                 title="Teardown — logout, when the user's session ends"
@@ -1079,8 +1188,6 @@ export function WorkflowTab(props: TabProps) {
                 onEdit={(i, s) => editStep({ phase: 'teardown', index: i }, s)}
                 onPickItem={(step, variable) => setPick({ step, variable })}
                 moves={[{ label: '→ iteration', title: 'Run every iteration instead', onMove: (i) => setDraft(moveBetween(draft, 'teardown', i, 'steps')) }]}
-                addLabel="+ Add logout step"
-                onAdd={() => setDraft({ ...draft, teardown: [{ name: 'POST /logout', request: { method: 'POST', url: '${baseUrl}/logout' } }] })}
               />
               <div>
                 <button

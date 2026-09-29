@@ -147,7 +147,7 @@ export class LoadWorker {
       try {
         const vu = new VirtualUser({
           workflow: ctx.workflow,
-          user: await this.pickUser(ctx, job.vuIndex),
+          ...(await this.pickUser(ctx, job.vuIndex)),
           vuIndex: job.vuIndex,
           metrics: ctx.collector,
           sampler: ctx.collector,
@@ -167,7 +167,10 @@ export class LoadWorker {
           if (i > 0 && (cfg.usersMode === 'per-iteration' || cfg.freshSession)) {
             await endSession();
             // a new user, or the same user with a clean session: the old cookies must not leak into the new login
-            if (cfg.usersMode === 'per-iteration') vu.setUser(await this.pickUser(ctx, job.vuIndex));
+            if (cfg.usersMode === 'per-iteration') {
+              const next = await this.pickUser(ctx, job.vuIndex);
+              vu.setUser(next.user, next.userRow);
+            }
             else vu.resetSession();
             if (shouldStop()) break;
           }
@@ -194,10 +197,11 @@ export class LoadWorker {
     }
   }
 
-  private async pickUser(ctx: RunContext, vuIndex: number): Promise<Record<string, string>> {
-    if (!ctx.config.usersCount) return {};
+  /** The user for the next session and its row in the users file (1 = first). Rows wrap around when there are fewer users than virtual users. */
+  private async pickUser(ctx: RunContext, vuIndex: number): Promise<{ user: Record<string, string>; userRow?: number }> {
+    if (!ctx.config.usersCount) return { user: {} };
     const index = ctx.config.usersMode === 'per-iteration' ? await this.state.nextUserIndex(ctx.runId) : vuIndex;
-    return this.state.getUser(ctx.runId, index);
+    return { user: await this.state.getUser(ctx.runId, index), userRow: (index % ctx.config.usersCount) + 1 };
   }
 
   private async reportActive(ctx: RunContext): Promise<void> {

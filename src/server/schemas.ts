@@ -75,12 +75,20 @@ const extractorSchema = z.object({
   regex: z.string().optional(),
   group: z.number().int().min(0).optional(),
   optional: z.boolean().optional(),
-  select: z.enum(['first', 'last', 'random']).optional(),
+  select: z.enum(['first', 'last', 'random', 'vu', 'iteration', 'sequence']).optional(),
+  list: z.boolean().optional(),
   default: z.string().optional(),
   transform: z
     .string()
     .optional()
     .refine((t) => parseFilterChain(t).unknown.length === 0, (t) => ({ message: `Unknown transform "${parseFilterChain(t).unknown.join(', ')}"` })),
+});
+
+const loopSchema = z.object({
+  list: z.string().regex(/^[A-Za-z_][\w.]*$/, 'Invalid list variable name'),
+  as: z.string().regex(/^[A-Za-z_]\w*$/, 'The item name must be a simple name, like customer'),
+  max: z.number().int().min(1).max(10_000).optional(),
+  order: z.enum(['sequential', 'random']).optional(),
 });
 
 const stepSchema = z.object({
@@ -89,6 +97,7 @@ const stepSchema = z.object({
   resourceType: z.string().optional(),
   sourceId: z.number().int().optional(),
   skipAuth: z.boolean().optional(),
+  each: loopSchema.optional(),
   set: z.record(z.string().regex(/^[A-Za-z_][\w.]*$/, 'Invalid variable name'), z.string()).optional(),
   request: z.object({
     method: z.string().regex(/^[A-Za-z]+$/),

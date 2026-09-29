@@ -146,6 +146,27 @@ The **Authentication** panel adds credentials to every request: a bearer token, 
 
 **Validate** runs the workflow once as one user and shows every request, its status, timing and the values extracted from it. Fix any red step here before loading the system.
 
+#### Which user logs in, and where every field comes from
+
+The recorded login contains one person's name and password. If it stays that way, every virtual user is that person. The **Data flow** panel warns about it ("POST /login sends the same userName for every virtual user"). Pick a column of the users file next to the warning and press **Take it from this column**. A recorded Base64 value stays Base64 encoded. Save the workflow afterwards.
+
+**Load & criteria** shows in words which row of the users file each virtual user and each iteration uses. Reports show the row on every call ("virtual user 3 (users file row 3)").
+
+Every body field and query parameter in a step has a **Where the value comes from** choice: a fixed value, a users-file column, an earlier step, a generated value, or the item of a loop. The encoding a field already has is kept when you change its source.
+
+#### Different customers that come from an API
+
+Open the value you use from the customers response and choose **Which item...**:
+
+| Choice | What happens |
+| --- | --- |
+| A different item for each virtual user | virtual user 1 gets item 1, virtual user 2 gets item 2, and so on |
+| The next item every iteration | one virtual user walks through the list, one item per iteration |
+| A different item for each user and iteration | both combined |
+| Every item | the whole list is saved, to repeat steps for each item |
+
+To repeat steps for every item, open the step and switch on **Repeat for each item of a list**. Choose the list and a name for one item (for example `customer`), then use `${customer.id}` or `${customer.address.city}` in the step. Steps that repeat over the same list one after another form one loop: item 1 runs all of them, then item 2. The report labels each call ("customer 2 of 5"). A loop runs at most 1000 items unless you set another limit, and a failed step ends the loop unless the workflow continues after errors.
+
 ### 4. Load & pass/fail criteria
 - **Virtual users (threads)**, **ramp-up**, and a stop condition: **duration** or **iterations per user**.
 - **How virtual users pick test users**: one user each (wraps round the list), strictly unique, or a new user every iteration.

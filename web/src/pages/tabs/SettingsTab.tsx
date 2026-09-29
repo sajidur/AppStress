@@ -7,6 +7,7 @@ import { METRICS, metricInfo } from '../../thresholds';
 import type { CaptureSettings, TestSettings, Threshold, ThresholdOp, UsersMode } from '../../types';
 
 const DEFAULT_CAPTURE: CaptureSettings = { okSamples: 3, errorSamples: 5, bodyKb: 16, maskSecrets: true, keepAll: true, maxCalls: 100_000 };
+import { describeUsers } from '../../sources';
 import type { TabProps } from '../TestPage';
 
 const USERS_MODES: { value: UsersMode; label: string; help: string }[] = [
@@ -98,6 +99,17 @@ export function SettingsTab({ test, reload }: TabProps) {
               ))}
             </div>
           </Field>
+          {(() => {
+            const plan = describeUsers(s, test.dataset?.rowCount ?? 0);
+            return (
+              <>
+                <div className="callout" aria-label="Which user each virtual user is">
+                  <b>Who is who:</b> {plan.summary}
+                </div>
+                {plan.warning && <div className="callout warn">⚠ {plan.warning}</div>}
+              </>
+            );
+          })()}
           {warnings.map((w) => (
             <div key={w} className="callout warn">
               ⚠ {w}

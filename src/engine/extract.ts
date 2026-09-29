@@ -1,5 +1,5 @@
 import type { Extractor } from '../types.js';
-import { getPathAll, pickOne } from './jsonpath.js';
+import { getPathAll, pickOne, type PickContext } from './jsonpath.js';
 
 export interface ResponseView {
   status: number;
@@ -22,7 +22,7 @@ function json(res: ResponseView): unknown {
   return res.json;
 }
 
-export function runExtractor(ex: Extractor, res: ResponseView): string | undefined {
+export function runExtractor(ex: Extractor, res: ResponseView, who?: PickContext): string | undefined {
   switch (ex.from) {
     case 'status':
       return String(res.status);
@@ -35,7 +35,10 @@ export function runExtractor(ex: Extractor, res: ResponseView): string | undefin
       return m ? (m[ex.group ?? 1] ?? m[0]) : undefined;
     }
     case 'body': {
-      const v = pickOne(getPathAll(json(res), ex.path ?? '$'), ex.select ?? 'first');
+      const all = getPathAll(json(res), ex.path ?? '$');
+      // a list keeps every match (objects stay objects) so steps can be repeated for each item
+      if (ex.list) return JSON.stringify(all);
+      const v = pickOne(all, ex.select ?? 'first', Math.random, who);
       if (v === undefined || v === null) return undefined;
       return typeof v === 'object' ? JSON.stringify(v) : String(v);
     }

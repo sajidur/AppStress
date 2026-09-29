@@ -210,10 +210,19 @@ export function getPath(obj: unknown, path: string): unknown {
   return getPathAll(obj, path)[0];
 }
 
-export type Select = 'first' | 'last' | 'random';
+export type Select = 'first' | 'last' | 'random' | 'vu' | 'iteration' | 'sequence';
 
-export function pickOne<T>(matches: T[], select: Select = 'first', random: () => number = Math.random): T | undefined {
+/** Who is asking: lets every virtual user and every iteration take a different item. */
+export interface PickContext {
+  vu: number;
+  iteration: number;
+}
+
+export function pickOne<T>(matches: T[], select: Select = 'first', random: () => number = Math.random, who: PickContext = { vu: 0, iteration: 0 }): T | undefined {
   if (!matches.length) return undefined;
+  if (select === 'vu') return matches[who.vu % matches.length];
+  if (select === 'iteration') return matches[who.iteration % matches.length];
+  if (select === 'sequence') return matches[(who.vu + who.iteration) % matches.length];
   if (select === 'last') return matches[matches.length - 1];
   if (select === 'random') return matches[Math.floor(random() * matches.length)];
   return matches[0];
