@@ -27,7 +27,7 @@
     "@fastify/static": "^8.3.0",
     "amqplib": "^0.10.4",
     "commander": "^12.1.0",
-    "fastify": "^5.12.5",
+    "fastify": "^5.12.6",
     "ioredis": "^5.4.1",
     "playwright": "^1.47.0",
     "zod": "^3.25.76"
